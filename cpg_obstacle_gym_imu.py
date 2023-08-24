@@ -71,15 +71,15 @@ import torch
 
 
 
-def read_servos_only(servos,data_read,cpg_index,step,imu,coef_real):
+def read_servos_only(servos,cpg_index,step,imu,coef_real,phase_now,cpg_now):
     
     # 输出应该是 仿真环境下的机器人状态
     # imu 输入的应该是角度 单位为度数
     agent_num=6
     start_t0=time.time()
     
-    phase_r = np.asarray(data_read['phase'])
-    cpg_r = np.asarray(data_read['cpg'])
+    #phase_r = np.asarray(data_read['phase'])
+    #cpg_r = np.asarray(data_read['cpg'])
     print("read data time: ",(time.time()-start_t0)*1000)
     start_t0=time.time()
     position_Read=servos.read_all_positions() # np array 18
@@ -95,7 +95,8 @@ def read_servos_only(servos,data_read,cpg_index,step,imu,coef_real):
     dz1=-length_12*math.tan(roll)
     dz2=-length_13*math.tan(roll)
     foot_z=np.zeros(6)
-    phase=phase_r[cpg_index,:]
+    #phase=phase_r[cpg_index,:]
+    phase=phase_now
     observation_temp=[]
     print("cal time: ",(time.time()-start_t1)*1000)
     
@@ -119,7 +120,8 @@ def read_servos_only(servos,data_read,cpg_index,step,imu,coef_real):
         print("forward pos time: ",(time.time()-start_t0)*1000)
             # 相位信息
             
-        phase_continus=cpg_r[agent_index,2:4,cpg_index]
+        #phase_continus=cpg_r[agent_index,2:4,cpg_index]
+        phase_continus=cpg_now[agent_index,2:4]
         start_t0=time.time()
         observation_agenti=np.concatenate((robot_joint_positions_agenti,imu,relative_foot_z,phase_continus,np.array([phase[agent_index]]),np.array([coef_real[agent_index]]),),)
         print("concatenate time: ",(time.time()-start_t0)*1000)
@@ -656,8 +658,9 @@ def reflex_(q_imu,q_servo_obs_now,q_servo_obs_next,q_pos_read,q_obs1,q_act):
                 
             # read feedback
             time_obs_before=time.time()
-
-            observation,position_Read=read_servos_only(servos,data_read_json,cpg_index,step,IMU_data_angles,coef_real)
+            cpg_now=cpg_r[:,:,cpg_index]
+            
+            observation,position_Read=read_servos_only(servos,cpg_index,step,IMU_data_angles,coef_real,phase_now,cpg_now)
             
             print("observation time",(time.time()-time_obs_before)*1000)
             q_obs1.put(observation)
