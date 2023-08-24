@@ -46,7 +46,7 @@ action_net5.load_state_dict(saved_model_5)
 action_net6.load_state_dict(saved_model_6)
 
 obs=torch.rand((1,66))
-for i in range(400):
+for i in range(100):
     start_t=time.time()
     ac1=action_net1(obs)
     #ac2=action_net2(obs)

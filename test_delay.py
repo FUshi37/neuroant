@@ -20,7 +20,7 @@ print("voltage",)
 #servos.enable_torque([10])
 servos.set_position_control()
 #servos.read_position_loop()
-for i in range(50):
+for i in range(100):
 
 	#servos.read_voltage(ID)
 	start_time=time.time()
@@ -36,5 +36,5 @@ for i in range(50):
 	#while(time.time()-start_time<0.010):
 	#    1
 	end_time=time.time()
-	print("last_time",end_time-start_time)
+	print("last_time",(end_time-start_time)*1000)
 	

@@ -1109,7 +1109,7 @@ def actuator_control_pd_10ms(P_gain,D_gain,max_speed):
 
                     p.stepSimulation()
                 end_time=time.time()
-                #print("last time",(end_time-start_time)*1000)
+                print("last time",(end_time-start_time)*1000)
                 
 
                 

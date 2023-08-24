@@ -694,15 +694,15 @@ if __name__ == '__main__':
     
     
     
-    #set_obs1 = Process(target=set_obs,args=(q_obs1,q_obs2,q_obs3,q_obs4,q_obs5,q_obs6,) )
-    #set_obs1.start()
+    set_obs1 = Process(target=set_obs,args=(q_obs1,q_obs2,q_obs3,q_obs4,q_obs5,q_obs6,) )
+    set_obs1.start()
     
     #actor1 = Process(target=actor_act,args=(q_obs1,action_net1,) )
     #actor1.start()
     
     
-    #actor1 = Process(target=load_and_actor,args=(model2_dir,q_obs1,) )
-    #actor1.start()
+    actor1 = Process(target=load_and_actor,args=(model2_dir,q_obs1,) )
+    actor1.start()
     #actor2 = Process(target=load_and_actor,args=(model2_dir,q_obs2,) )
     #actor2.start()
     #actor3 = Process(target=load_and_actor,args=(model3_dir,q_obs3,) )
