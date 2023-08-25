@@ -204,7 +204,27 @@ def real_torque_to_sim_torque(real_current):
             
            
         
-    return torque_sim            
+    return torque_sim     
+
+
+def crc16_cal(datalist):
+    test_crc=0xFFFF                 #预置1个16位的寄存器为十六进制FFFF（即全为1），称此寄存器为CRC寄存器；
+    poly=0xa001
+    # poly=0x8005
+    numl=len(datalist)
+    for num in range(numl):
+        data=datalist[num]
+        test_crc=(data&0xFF)^test_crc   #把第一个8位二进制数据（既通讯信息帧的第一个字节）与16位的CRC寄存器的低8位相异或，把结果放于CRC寄存器，高八位数据不变；
+        
+        #右移动
+        for bit in range(8):
+            if(test_crc&0x1)!=0:
+                test_crc>>=1
+                test_crc^=poly
+            else:
+                test_crc>>=1
+    #print(hex(test_crc))
+    return test_crc       
 
     
     

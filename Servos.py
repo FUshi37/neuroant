@@ -2,7 +2,7 @@ import os
 import numpy as np
 import time
 
-
+'''
 if os.name == 'nt':
     import msvcrt
     def getch():
@@ -18,6 +18,7 @@ else:
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         return ch
+'''
 
 from dynamixel_sdk import *                    # Uses Dynamixel SDK library
 class Servos:

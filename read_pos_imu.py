@@ -216,6 +216,89 @@ def read_imu(q_imu):
     
     device.dataProcessor.onVarChanged.append(onUpdate)  #数据更新事件 Data update event
     #q_imu.put(IMU_data)
+
+
+def  servo_action(servos,ser):
+    last_time=time.time()
+    receive_count=0
+    while 1:
+        count_receive = ser.inWaiting()
+        '''
+        if count >=72:
+            #data1=ser.readline()
+            #data = ser.readline()
+            print("count",count,time.time())
+            data1 = ser.read(72)
+            data_unpack=struct.unpack('<18f',data1)
+            # 发过来的是实际的机器人上的目标指令
+            print("unpack all",data_unpack,"time:",time.time())
+            goal_theta=np.array(data_unpack)
+            servo.write_all_positions(goal_theta)
+            print("write done")
+        '''
+            
+        if count_receive >=75:
+                #data1=ser.readline()
+                #data = ser.readline()
+                last_time=time.time()
+                
+                count1 = ser.inWaiting()
+                if count1>count_receive:
+                    count_receive=count1
+                data1 = ser.read(count_receive)
+                print("count",count_receive,time.time(),"receive_count",receive_count)
+                #data1 = ser.read(75)
+                receive_count+=1
+                
+                data_array_read=data1[:72]
+                crc_read=data1[72:74]
+                crc_int=int.from_bytes(crc_read, byteorder='big', signed=True)
+                crc_cal=crc16_cal(data_array_read)
+            
+                if crc_int==crc_cal:
+                    data_right=1
+                    #ser.write(b'OK')
+                    print("ok")
+                else:
+                    data_right=0
+                #ser.write(b'RE')
+                    print("not right ")
+                    #data_unpack=struct.unpack('<18f',data_array_read)
+                    #print("unpack all",data_unpack,"time:",time.time())
+                if data_right:
+                    data_unpack=struct.unpack('<18f',data_array_read)
+                    # 发过来的是实际的机器人上的目标指令
+                    print("unpack all",data_unpack,"time:",time.time())
+                    goal_theta=np.array(data_unpack)
+                    servos.write_all_positions(goal_theta)
+                    print("####--------------------------------------write done time :",time.time())
+                else:
+                    data_unpack=struct.unpack('<18f',data_array_read)
+                    # 发过来的是实际的机器人上的目标指令
+                    print("unpack all",data_unpack,"time:",time.time())
+                    goal_theta=np.array(data_unpack)
+                    flag=1
+                    for servo_i in range(18):
+                        if goal_theta[servo_i]>3000 or goal_theta[servo_i]<600:
+                            flag=0
+                    if flag==1:
+                        servos.write_all_positions(goal_theta)
+                        print("####--------------------------------------write done time :",time.time())
+                        
+                        
+                
+                    
+                        
+        if (time.time()-last_time)*1000>35 and count_receive>70:
+            count1 = ser.inWaiting()
+            data1 = ser.read(count1)
+            receive_count+=1
+            
+            print("incorrect serial","count",count1,"time",(time.time()-last_time)*1000,"receive_count",receive_count)
+            last_time=time.time()
+            
+            
+                
     
 
 
@@ -223,7 +306,7 @@ def read_imu(q_imu):
 
               
 
-def reflex_(q_imu,ser):
+def reflex_(q_imu,ser,servos):
     
 
     #set_pybullet()
@@ -259,7 +342,7 @@ def reflex_(q_imu,ser):
     
 
     # init servos
-    servos=Servos()
+    
     voltage=servos.read_voltage(1)
     servos.set_position_control()
     #position_Read=servos.read_position_loop()
@@ -267,6 +350,24 @@ def reflex_(q_imu,ser):
     print("Press any key to enable legs! (or press ESC to escape!)")
     #if getch() != chr(0x1b):
         #servos.enable_torque(position_all)
+    servos.enable_torque(position_all)
+    position_Read=servos.read_all_positions()
+    print("read position:",position_Read)
+    
+    theta_sim=goal_pos_sim[step]    
+    angles_real=sim_angles_to_real(theta_sim)
+    servos.Robot_initialize(angles_real)
+    goal_theta_tick=angles_to_tick(angles_real)
+    time.sleep(5)
+    position_Read=servos.read_all_positions()
+    position_Read_tick=angles_to_tick(position_Read)
+    flat_cpg_tick=current_pos_tick[step] #18
+    
+
+    theta_tick=angles_to_tick(angles_real)
+    servos.write_all_positions(theta_tick)
+    servos.write_all_positions(theta_tick)
+    servos.write_all_positions(theta_tick)
     
     
     
@@ -357,9 +458,44 @@ def reflex_(q_imu,ser):
         data_array=struct.pack('<27f',*observation_agenti)	
         print("concatenate time: ",(time.time()-start_time_t)*1000)
         ser.write(data_array)
+        '''
+        count_receive = ser.inWaiting()
+        for receive_times in range(10):
+            if count_receive >=75:
+                #data1=ser.readline()
+                #data = ser.readline()
+                print("count",count_receive,time.time())
+                data1 = ser.read(75)
+                
+                data_array_read=data1[:72]
+                crc_read=data1[72:74]
+                crc_int=int.from_bytes(crc_read, byteorder='big', signed=True)
+                crc_cal=crc16_cal(data_array_read)
+            
+                if crc_int==crc_cal:
+                    data_right=1
+                    #ser.write(b'OK')
+                    print("ok")
+                else:
+                    data_right=0
+                #ser.write(b'RE')
+                    print("re")
+                    #data_unpack=struct.unpack('<18f',data_array_read)
+                    #print("unpack all",data_unpack,"time:",time.time())
+                if data_right:
+                    data_unpack=struct.unpack('<18f',data_array_read)
+                    # 发过来的是实际的机器人上的目标指令
+                    print("unpack all",data_unpack,"time:",time.time())
+                    goal_theta=np.array(data_unpack)
+                    servos.write_all_positions(goal_theta)
+                    print("write done")
+        if receive_times>=9:
+            print("not receive!  ")
+        '''
         while (time.time()-start_time_t)*1000<20.0:
             1
-        print("end time: ",(time.time()-start_time_t)*1000)
+        print("end time: ",(time.time()-start_time_t)*1000,"count",count)
+        
         
         
         
@@ -413,25 +549,28 @@ if __name__ == '__main__':
     q_obs1=Queue()
     
     
-    model1_dir="/home/fast3/Desktop/DynamixelSDK-3.7.31/python/tests/protocol2_0/distill_model/action_net_one_BC_mlp_new2_1_70.pt"
+    model1_dir="/home/fast3/Desktop/DynamixelSDK-3.7.31/python/tests/protocol2_0/distill_model/action_net_one_BC_mlp_new2_1_160.pt"
     # socket
 
     
     Read_IMU = Process(target=read_imu,args=(q_imu,) )
     Read_IMU.start()
-    time.sleep(6)
-    ser = serial.Serial("/dev/ttyAMA1",115200*16,parity='E',timeout=0.00001)
+    time.sleep(3)
+    ser = serial.Serial("/dev/ttyAMA4",115200*16,parity='E',timeout=0.00001)
 
     if not ser.isOpen():
         print("open failed")
     else:
         print("open success: ")
         print(ser)
+    servos=Servos()
+    Reflex_ = Process(target=servo_action,args=(servos,ser) )
+    Reflex_.start()
+    time.sleep(3)
     
 
-    reflex_(q_imu,ser)
-    #Reflex_ = Process(target=reflex_,args=(q_imu,) )
-    #Reflex_.start()
+    reflex_(q_imu,ser,servos)
+    
     
     
     
