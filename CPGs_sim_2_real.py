@@ -226,8 +226,8 @@ servos.read_voltage(1
                     )
 servos.set_position_control()
 goal_position=np.array([180,204,85,180,204,85])
-position_Read=servos.read_position_loop()
-print("read position:",position_Read)
+#position_Read=servos.read_position_loop()
+#print("read position:",position_Read)
 DXLn_ID=[0,1,2,3,4,5]
 servos.enable_torque(DXLn_ID)
 #print("Press any key to continue! (or press ESC to move leg2!)")
@@ -305,9 +305,9 @@ for step in range(240*1):
     #while (time.time()-start_time_t)*1000<20.00:
     #    1
     end_time_t=time.time()
-    print("last time",end_time_t-start_time_t)
+    print("last time",(end_time_t-start_time_t)*1000)
     
-    print("Press any key to continue! (or press ESC to escape)")
+    #print("Press any key to continue! (or press ESC to escape)")
     #if getch() != chr(0x1b):
         #servos.write_some_positions(angles_real[0:6],DXLn_ID)
         #servos.write_all_positions_angles(angles_real)

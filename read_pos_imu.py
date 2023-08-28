@@ -218,7 +218,7 @@ def read_imu(q_imu):
     #q_imu.put(IMU_data)
 
 
-def  servo_action(servos,ser):
+def  servo_action(servos,ser,q_act):
     last_time=time.time()
     receive_count=0
     while 1:
@@ -270,8 +270,9 @@ def  servo_action(servos,ser):
                     # 发过来的是实际的机器人上的目标指令
                     print("unpack all",data_unpack,"time:",time.time())
                     goal_theta=np.array(data_unpack)
-                    servos.write_all_positions(goal_theta)
-                    print("####--------------------------------------write done time :",time.time())
+                    q_act.put(goal_theta)
+                    #servos.write_all_positions(goal_theta)
+                    print("####--------------------------------------put done time :",time.time())
                 else:
                     data_unpack=struct.unpack('<18f',data_array_read)
                     # 发过来的是实际的机器人上的目标指令
@@ -282,19 +283,23 @@ def  servo_action(servos,ser):
                         if goal_theta[servo_i]>3000 or goal_theta[servo_i]<600:
                             flag=0
                     if flag==1:
-                        servos.write_all_positions(goal_theta)
-                        print("####--------------------------------------write done time :",time.time())
+                        #servos.write_all_positions(goal_theta)
+                        q_act.put(goal_theta)
+                        print("####--------------------------------------put done time :",time.time())
+                    else:
+                        print("####--------------------------------------not  put done time :",time.time())
+                        q_act.put("not")
                         
                         
                 
                     
                         
-        if (time.time()-last_time)*1000>35 and count_receive>70:
+        if (time.time()-last_time)*1000>20 and count_receive>70:
             count1 = ser.inWaiting()
             data1 = ser.read(count1)
             receive_count+=1
-            
-            print("incorrect serial","count",count1,"time",(time.time()-last_time)*1000,"receive_count",receive_count)
+            q_act.put("not")
+            print("incorrect serial---------------","count",count1,"time",(time.time()-last_time)*1000,"receive_count",receive_count)
             last_time=time.time()
             
             
@@ -306,7 +311,7 @@ def  servo_action(servos,ser):
 
               
 
-def reflex_(q_imu,ser,servos):
+def reflex_(q_imu,ser,servos,q_act,num_T):
     
 
     #set_pybullet()
@@ -350,6 +355,8 @@ def reflex_(q_imu,ser,servos):
     print("Press any key to enable legs! (or press ESC to escape!)")
     #if getch() != chr(0x1b):
         #servos.enable_torque(position_all)
+        
+    
     servos.enable_torque(position_all)
     position_Read=servos.read_all_positions()
     print("read position:",position_Read)
@@ -358,7 +365,7 @@ def reflex_(q_imu,ser,servos):
     angles_real=sim_angles_to_real(theta_sim)
     servos.Robot_initialize(angles_real)
     goal_theta_tick=angles_to_tick(angles_real)
-    time.sleep(5)
+    
     position_Read=servos.read_all_positions()
     position_Read_tick=angles_to_tick(position_Read)
     flat_cpg_tick=current_pos_tick[step] #18
@@ -368,6 +375,11 @@ def reflex_(q_imu,ser,servos):
     servos.write_all_positions(theta_tick)
     servos.write_all_positions(theta_tick)
     servos.write_all_positions(theta_tick)
+    time.sleep(5)
+    q_act.put(theta_tick)
+    #q_act.put(theta_tick)
+    #q_act.put(theta_tick)
+    
     
     
     
@@ -391,15 +403,24 @@ def reflex_(q_imu,ser,servos):
 
 
     
-    for count in range(int(T*1)):
+    for count in range(int(T*num_T)):
         start_time_t=time.time()
+        action_flag=0
         
         # 接收imu的数据
-        print("empty",q_imu.empty())
+        print("imu empty",q_imu.empty(),)
         IMU_data=q_imu.get(True,3)
+        
+        '''
+        if q_act.empty()==False:
+            action_theta_tick=q_act.get(True,5)
+            action_flag=1
+            print("action")
+        '''
         
         while( not q_imu.empty()):
             IMU_data=q_imu.get(True,10)
+            
         #if count==0:
         #    imu_init=IMU_data
         #    IMU_data[0:3]=IMU_data[0:3]-imu_init[0:3]
@@ -414,13 +435,26 @@ def reflex_(q_imu,ser,servos):
         
         # roll  绕着x轴旋转 x 轴是身体横向  
         # 仿真中roll  和实际中roll的方向相同
+        '''
+        if q_act.empty()==False:
+            action_theta_tick=q_act.get(True,5)
+            action_flag=1
+            print("action")
+        '''
+        
         print("roll pitch yaw: ",roll ,pitch,yaw)
         print("imu time: ",(time.time()-start_time_t)*1000)
         start_t0=time.time()
         position_Read=servos.read_all_positions() # np array 18
-        
         end_t=time.time()
         print("read time: ",(end_t-start_t0)*1000)
+        
+        
+       
+        
+            
+        
+       
         start_t1=time.time()
         theta_sim=real_angles_to_sim(position_Read)
     
@@ -458,6 +492,29 @@ def reflex_(q_imu,ser,servos):
         data_array=struct.pack('<27f',*observation_agenti)	
         print("concatenate time: ",(time.time()-start_time_t)*1000)
         ser.write(data_array)
+         # get actioon
+        
+        start_time_action=time.time()
+        while 1:
+            if  q_act.empty()==False:
+                action_theta_tick=q_act.get(True,10)
+                while( not q_act.empty()):
+                    action_theta_tick=q_act.get(True,10)
+                print(" get action")
+                break
+            if (time.time()-start_time_t)*1000>39:
+                print("no action!!!!!")
+                break
+                    
+                
+            
+        if  action_theta_tick=="not":
+            print("--------------------------skip---------------------------")
+        else: 
+            servos.write_all_positions(action_theta_tick)
+        print("write action",(time.time()-start_time_t)*1000,)
+        
+        
         '''
         count_receive = ser.inWaiting()
         for receive_times in range(10):
@@ -494,6 +551,8 @@ def reflex_(q_imu,ser,servos):
         '''
         while (time.time()-start_time_t)*1000<20.0:
             1
+        if (time.time()-start_time_t)*1000>=20.5:
+            print("--------over time --------------")
         print("end time: ",(time.time()-start_time_t)*1000,"count",count)
         
         
@@ -523,7 +582,7 @@ from Servos import *
 if __name__ == '__main__':
     #global IMU_data 
     
-    
+    num_T=8
     #IMU_data =np.array([1,1,1,0,0,0,1,1,1,])
     with open('force_real7.json', 'r') as f:
     
@@ -564,12 +623,12 @@ if __name__ == '__main__':
         print("open success: ")
         print(ser)
     servos=Servos()
-    Reflex_ = Process(target=servo_action,args=(servos,ser) )
+    Reflex_ = Process(target=servo_action,args=(servos,ser,q_act) )
     Reflex_.start()
     time.sleep(3)
     
 
-    reflex_(q_imu,ser,servos)
+    reflex_(q_imu,ser,servos,q_act,num_T)
     
     
     

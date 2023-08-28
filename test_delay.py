@@ -7,7 +7,7 @@ from multiprocessing import Process,Queue
 import numpy as np
 from CPGs import *
 import time
-import matplotlib.pyplot as plt
+
 
 from Servos import *
 
@@ -20,7 +20,7 @@ print("voltage",)
 #servos.enable_torque([10])
 servos.set_position_control()
 #servos.read_position_loop()
-for i in range(200):
+for i in range(40):
 
 	#servos.read_voltage(ID)
 	start_time=time.time()

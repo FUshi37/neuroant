@@ -406,7 +406,7 @@ def reflex_(q_imu,q_servo_obs_now,q_servo_obs_next,q_pos_read):
 
 
     
-    for count in range(int(T*6)):
+    for count in range(int(T*8)):
         start_time_t=time.time()
         
         # 接收imu的数据
@@ -561,7 +561,7 @@ def reflex_(q_imu,q_servo_obs_now,q_servo_obs_next,q_pos_read):
             
             
             
-            coef_delta=0.4
+            coef_delta=0.9
            
                  
             
