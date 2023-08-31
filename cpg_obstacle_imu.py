@@ -324,7 +324,7 @@ def reflex_(q_imu):
     step=0
     T=240
     T_count=0
-    coef=2
+    coef=1
     coef_stance=1
     step=0
     reflex=np.zeros(6)
@@ -334,7 +334,7 @@ def reflex_(q_imu):
 
 
     
-    for count in range(int(T*4)):
+    for count in range(int(T*8)):
         start_time_t=time.time()
         
         # 接收imu的数据
@@ -441,7 +441,7 @@ def reflex_(q_imu):
                 reflex_sim=np.zeros_like(on_reflex)
                 #coef_stance=1
             else:
-                coef=2
+                coef=1
                 #coef_stance=1.5
             theta_sim=goal_pos_sim[step] 
             theta_new_sim=get_reflex_theta_all(theta_sim,coef,coef_stance,reflex_sim,on_reflex,reflex_stance_sim,on_reflex_stance,phase_now,stance_step_per_reflex,swing_step_per_reflex)
@@ -522,7 +522,7 @@ def reflex_(q_imu):
 
     
     # csv
-    with open('data_reflex_imu_4_20_9.csv', mode='w', newline='') as csv_file:
+    with open('data_reflex_cpg_s_n_2.csv', mode='w', newline='') as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(['count','T_count','sum_leg','reflex_sim','reflex_stance_sim','on_reflex2','on_reflex_stance2','reflex_index2','reflex_index_stance2','swing_step_count','flat_cpg_tick','position_Read_tick','IMU_data'])
         writer.writerows(csv_rows)

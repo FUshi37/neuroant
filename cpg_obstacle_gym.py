@@ -406,7 +406,7 @@ def reflex_(q_imu,q_servo_obs_now,q_servo_obs_next,q_pos_read):
 
 
     
-    for count in range(int(T*8)):
+    for count in range(int(T*6)):
         start_time_t=time.time()
         
         # 接收imu的数据
@@ -690,7 +690,7 @@ def reflex_(q_imu,q_servo_obs_now,q_servo_obs_next,q_pos_read):
 
     
     # csv
-    with open('data_reflex_imu_4_20_13.csv', mode='w', newline='') as csv_file:
+    with open('data_reflex_net_test3.csv', mode='w', newline='') as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(['count','T_count','sum_leg','reflex_sim','reflex_stance_sim','on_reflex2','on_reflex_stance2','reflex_index2','reflex_index_stance2','swing_step_count','flat_cpg_tick','position_Read_tick','IMU_data'])
         writer.writerows(csv_rows)
