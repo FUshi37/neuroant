@@ -1,17 +1,17 @@
 import os
 import numpy as np
 import time
-
+import getch
 '''
 if os.name == 'nt':
     import msvcrt
-    def getch():
+    def getch.getch() :
         return msvcrt.getch().decode()
 else:
     import sys, tty, termios
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
-    def getch():
+    def getch.getch() :
         try:
             tty.setraw(sys.stdin.fileno())
             ch = sys.stdin.read(1)
@@ -54,7 +54,7 @@ class Servos:
 
         # Default setting
         self.BAUDRATE = 4000000  # Dynamixel default baudrate : 57600
-        self.DEVICENAME = '/dev/ttyUSB1'  # Check which port is being used on your controller
+        self.DEVICENAME = '/dev/ttyUSB2'  # Check which port is being used on your controller
         # ex) Windows: "COM1"   Linux: "/dev/ttyUSB0" Mac: "/dev/tty.usbserial-*"
 
         self.TORQUE_ENABLE = 1  # Value for enabling the torque
@@ -78,7 +78,7 @@ class Servos:
         else:
             print("Failed to open the port")
             print("Press any key to terminate...")
-            getch()
+            getch.getch() 
             quit()
 
         # Set port baudrate
@@ -87,7 +87,7 @@ class Servos:
         else:
             print("Failed to change the baudrate")
             print("Press any key to terminate...")
-            getch()
+            getch.getch() 
             quit()
 
 
@@ -239,7 +239,7 @@ class Servos:
         while 1:
             # Syncread present position
             print("Press any key to continue! (or press ESC to quit!)")
-            if getch() == chr(0x1b):
+            if getch.getch()  == chr(0x1b):
                 break
             dxl_comm_result = groupSyncRead.txRxPacket()
             if dxl_comm_result != COMM_SUCCESS:

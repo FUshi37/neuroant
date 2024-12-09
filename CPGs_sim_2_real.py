@@ -159,8 +159,14 @@ def real_torque_to_sim_torque(real_current):
     return torque_sim            
 
 
-with open('force_real17.json', 'r') as f:
-    
+file_first_name='force_real_wave_'
+file_last_name='19.json'
+file_name=file_first_name+file_last_name
+output_file_first_name='pos_cpg_5_'
+output_file_name=output_file_first_name+file_last_name
+#with open('force_real17.json', 'r') as f:
+#with open('force_real_four_30_1.json','r') as f:
+with open(file_name,'r') as f:    
     data_read = json.load(f)
     force_r = np.asarray(data_read['contact_force'])
     phase_r = np.asarray(data_read['phase'])
@@ -172,7 +178,10 @@ with open('force_real17.json', 'r') as f:
 
 step= 0
 cpg_index=ini_index_r[0]
-with open('pos_20_17.json', 'r') as f:
+if cpg_index>240:
+    cpg_index=cpg_index-240*int(cpg_index/240)
+    
+with open('pos_20_17_1.json', 'r') as f:
         
     data_read = json.load(f)
     positions_tick = np.asarray(data_read['positions_tick'])
@@ -317,13 +326,15 @@ for step in range(240*1):
     
     cpg_index=cpg_index+1
 
-str1="pos_20_17_3"+".json"
-print(str1)
+str1="pos_cpg_4_30_1"+".json"
+print(output_file_name)
 #data = {'positions': positions,'current_pos_tick':current_pos_tick,'goal_pos_sim':goal_pos_sim,'phase':phase_all,}
 data = {'positions_tick': positions,'current_pos_tick':current_pos_tick,'goal_pos_sim':goal_pos_sim,'phase':phase_all,}
 data_json = json.dumps(data, cls=NumpyArrayEncoder)
-with open(str1, 'w') as f:
+with open(output_file_name, 'w') as f:
     json.dump(data, f, cls=NumpyArrayEncoder)
     print("save data done!")
-print("Press any key to disable legs")
+#print("Press any key to disable legs")
+DXLn_ID=range(18)
+#servos.disable_torque(DXLn_ID)
         

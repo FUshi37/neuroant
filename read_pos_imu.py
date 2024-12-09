@@ -204,7 +204,7 @@ def read_imu(q_imu):
     )
 
     if (platform.system().lower() == 'linux'):
-        device.serialConfig.portName = "/dev/ttyUSB0"   #设置串口   Set serial port
+        device.serialConfig.portName = "/dev/ttyUSB1"   #设置串口   Set serial port
     else:
         device.serialConfig.portName = "COM39"          #设置串口   Set serial port
     device.serialConfig.baud = 230400                     #设置波特率  Set baud rate
@@ -489,7 +489,11 @@ def reflex_(q_imu,ser,servos,q_act,num_T):
         
         print("last time: ",(time.time()-start_time_t)*1000)
         observation_agenti=np.concatenate((position_Read,IMU_data_1,relative_foot_z_all),).tolist()
-        data_array=struct.pack('<27f',*observation_agenti)	
+        data_array=struct.pack('<27f',*observation_agenti)
+        crc=crc16_cal(data_array)
+        crc1=crc.to_bytes(2,'big')	
+        end=b'\n'
+        obs_array_crc=data_array+crc1
         print("concatenate time: ",(time.time()-start_time_t)*1000)
         ser.write(data_array)
          # get actioon
@@ -582,7 +586,7 @@ from Servos import *
 if __name__ == '__main__':
     #global IMU_data 
     
-    num_T=8
+    num_T=30
     #IMU_data =np.array([1,1,1,0,0,0,1,1,1,])
     with open('force_real7.json', 'r') as f:
     
