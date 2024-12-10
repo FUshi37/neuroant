@@ -405,17 +405,17 @@ from Servos import *
 
 if __name__ == '__main__':
     #global IMU_data 
-    file_first_name='force_real_wave_'
-    file_last_name='17_1'
+    file_first_name='force_real_four_'
+    file_last_name='new_36_1'
     file_name=file_first_name+file_last_name+'.json'
-    output_file_first_name='pos_cpg_5_'
-    record_file_first_name='record_cpg_5_'
-    output_file_name=record_file_first_name+file_last_name+'.csv'
+    output_file_first_name='pos_cpg_4_'
+    record_file_first_name='record_fix_cpg_4_'
+    output_file_name=record_file_first_name+file_last_name+'_2.csv'
     tick_file_name=output_file_first_name+file_last_name+'.json'
     
     #file_name="force_real17.json"
     #tick_file_name="pos_20_17_1.json"
-    #output_file_name='pos_cpg_3_2.csv'
+    #output_file_name='record_fix_new_cpg_3_3.csv'
     
         
     

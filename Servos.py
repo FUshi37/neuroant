@@ -54,7 +54,7 @@ class Servos:
 
         # Default setting
         self.BAUDRATE = 4000000  # Dynamixel default baudrate : 57600
-        self.DEVICENAME = '/dev/ttyUSB2'  # Check which port is being used on your controller
+        self.DEVICENAME = '/dev/ttyUSB1'  # Check which port is being used on your controller
         # ex) Windows: "COM1"   Linux: "/dev/ttyUSB0" Mac: "/dev/tty.usbserial-*"
 
         self.TORQUE_ENABLE = 1  # Value for enabling the torque

@@ -160,7 +160,7 @@ def real_torque_to_sim_torque(real_current):
 
 
 file_first_name='force_real_wave_'
-file_last_name='19.json'
+file_last_name='new_17_2.json'
 file_name=file_first_name+file_last_name
 output_file_first_name='pos_cpg_5_'
 output_file_name=output_file_first_name+file_last_name
@@ -269,6 +269,7 @@ current_pos_tick=[]
 
 theta_sim=theta_r[cpg_index,:,:]
 angles_real=sim_angles_to_real(theta_sim)
+servos.Robot_initialize(angles_real)
 theta_tick=angles_to_tick(angles_real)
 servos.write_all_positions(theta_tick)
 time.sleep(0.5)
