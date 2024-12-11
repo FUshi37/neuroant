@@ -51,6 +51,148 @@ from reflex_related import *
 
 
 
+def sim_angles_to_real0(theta):
+    # theta [6,3]
+    real_angles=np.zeros_like(theta).flatten()
+    for i in range(6):
+        if i<3:
+            
+            hip=180+theta[i,0]/math.pi*180 
+            
+            knee=180-theta[i,1]/math.pi*180
+            ankle=62.69+theta[i,2]/math.pi*180
+            
+            real_angles[3+i*6+0]=hip
+            real_angles[3+i*6+1]=knee
+            real_angles[3+i*6+2]=ankle
+            
+        else:
+            hip=180+theta[i,0]/math.pi*180 
+            knee=180+theta[i,1]/math.pi*180
+            ankle=62.69-theta[i,2]/math.pi*180
+            
+            real_angles[0+(i-3)*6+0]=hip
+            real_angles[0+(i-3)*6+1]=knee
+            real_angles[0+(i-3)*6+2]=ankle
+        
+    return real_angles
+
+def angles_to_tick(angles):
+    theta_tick=np.zeros_like(angles)
+    for i in range(18):
+        theta_tick[i]=int(angles[i]/180*2048)
+    return theta_tick
+            
+
+def real_angles_to_sim0(real_angles):
+    # theta [6,3]
+    theta=np.zeros((6,3))
+    for i in range(6):
+        if i<3:
+            theta[i,0]= (real_angles[3+i*6+0]-180)/180*math.pi
+            theta[i,1]= (-real_angles[3+i*6+1]+180)/180*math.pi
+            theta[i,2]= (real_angles[3+i*6+2]-62.69)/180*math.pi
+            
+            
+            
+        else:
+            theta[i,0]= (real_angles[0+(i-3)*6+0]-180)/180*math.pi
+            theta[i,1]= (real_angles[0+(i-3)*6+1]-180)/180*math.pi
+            theta[i,2]= (-real_angles[0+(i-3)*6+2]+62.69)/180*math.pi
+            
+           
+        
+    return theta      
+
+def real_angles_to_sim(real_angles):
+    # theta [6,3]
+    
+    theta=np.zeros((6,3))
+    for i in range(6):
+        if i<3:
+            theta[i,0]= -(real_angles[0+i*6+0]-180)/180.0*math.pi
+            theta[i,1]= (-real_angles[0+i*6+1]+180)/180.0*math.pi
+            theta[i,2]= (real_angles[0+i*6+2]-62.69)/180.0*math.pi
+            
+            
+            
+        else:
+            theta[i,0]= -(real_angles[3+(i-3)*6+0]-180)/180.0*math.pi
+            theta[i,1]= (real_angles[3+(i-3)*6+1]-180)/180.0*math.pi
+            theta[i,2]= (-real_angles[3+(i-3)*6+2]+62.69)/180.0*math.pi
+            
+           
+        
+    return theta
+
+def sim_angles_to_real(theta):
+    # theta [6,3]  杈撳�? np array [18]
+    real_angles=np.zeros_like(theta).flatten()*1.00000
+    for i in range(6):
+        if i<3:
+            
+            hip=(180-theta[i,0]/math.pi*180)
+            
+            knee=180-theta[i,1]/math.pi*180+17
+            ankle=62.69+theta[i,2]/math.pi*180
+            
+            real_angles[0+i*6+0]=hip
+            real_angles[0+i*6+1]=knee
+            real_angles[0+i*6+2]=ankle
+            
+        else:
+            hip=(180-theta[i,0]/math.pi*180) 
+            knee=180+theta[i,1]/math.pi*180+17
+            ankle=62.69-theta[i,2]/math.pi*180
+            
+            real_angles[3+(i-3)*6+0]=hip
+            real_angles[3+(i-3)*6+1]=knee
+            real_angles[3+(i-3)*6+2]=ankle
+        
+    return real_angles    
+
+def real_current_to_sim_torque(real_current):
+    # theta [6,3]
+    torque_sim=np.zeros((6,3))
+    real_torque1=real_current.reshape(6,3)
+    for i in range(6):
+        if i<3:
+            torque_sim[i,0]= real_current[3+i*6+0]*2.69/1000*1.82-0.2576
+            torque_sim[i,1]= -(real_current[3+i*6+1]*2.69/1000*1.82-0.2576)
+            torque_sim[i,2]= real_current[3+i*6+2]*2.69/1000*1.82-0.2576
+            
+            
+            
+        else:
+            torque_sim[i,0]= real_current[0+(i-3)*6+0]*2.69/1000*1.82-0.2576
+            torque_sim[i,1]= real_current[0+(i-3)*6+1]*2.69/1000*1.82-0.2576
+            torque_sim[i,2]= -(real_current[0+(i-3)*6+2]*2.69/1000*1.82-0.2576)
+            
+           
+        
+    return torque_sim     
+
+def real_torque_to_sim_torque(real_current):
+    # theta [6,3]
+    torque_sim=np.zeros((6,3))
+    
+    for i in range(6):
+        if i<3:
+            torque_sim[i,0]= real_current[3+i*6+0]
+            torque_sim[i,1]= -(real_current[3+i*6+1])
+            torque_sim[i,2]= real_current[3+i*6+2]
+            
+            
+            
+        else:
+            torque_sim[i,0]= real_current[0+(i-3)*6+0]
+            torque_sim[i,1]= real_current[0+(i-3)*6+1]
+            torque_sim[i,2]= -(real_current[0+(i-3)*6+2])
+            
+           
+        
+    return torque_sim            
+
 
 
 
@@ -264,15 +406,15 @@ def reflex_(q_imu):
 
 
     #with open('pos_0_5_10_1.json', 'r') as f:
-    with open(tick_file_name, 'r') as f:
-        
+    with open(file_name,'r') as f:    
         data_read = json.load(f)
-        positions_tick = np.asarray(data_read['positions_tick'])
-        current_pos_tick = np.asarray(data_read['current_pos_tick'])
-        goal_pos_sim = np.asarray(data_read['goal_pos_sim'])
-        phase = np.asarray(data_read['phase'])
-        
-    step= 0
+        theta_target = np.asarray(data_read['theta'])
+        theta_sim_r_old = np.asarray(data_read['theta_real_n'])
+        IMU_r = np.asarray(data_read['IMU_n'])
+    theta_sim_r=theta_sim_r_old    
+    step= 150
+    test_length=theta_sim_r.shape[0]-1
+    test_length=700
 
     # init servos
     servos=Servos()
@@ -287,20 +429,20 @@ def reflex_(q_imu):
     position_Read=servos.read_all_positions()
     print("read position:",position_Read)
     
-    theta_sim=goal_pos_sim[step]    
+    theta_sim=theta_sim_r[step]    
     angles_real=sim_angles_to_real(theta_sim)
     servos.Robot_initialize(angles_real)
     goal_theta_tick=angles_to_tick(angles_real)
-    time.sleep(1)
+    time.sleep(15)
     position_Read=servos.read_all_positions()
     position_Read_tick=angles_to_tick(position_Read)
-    flat_cpg_tick=current_pos_tick[step] #18
+    
     
 
     theta_tick=angles_to_tick(angles_real)
-    servos.write_all_positions(theta_tick)
-    servos.write_all_positions(theta_tick)
-    servos.write_all_positions(theta_tick)
+    #servos.write_all_positions(theta_tick)
+    #servos.write_all_positions(theta_tick)
+    #servos.write_all_positions(theta_tick)
 
 
 
@@ -321,20 +463,21 @@ def reflex_(q_imu):
     csv_rows=[]
     
     
-    step=0
+    #step=0
     T=240
     T_count=0
     coef=1
     coef_stance=1
-    step=0
+    #step=0
     reflex=np.zeros(6)
     # ������ÿ��swing or reflex�еĲ���
     swing_step_count=0
+    Interpolation_num=70
 
 
 
-    
-    for count in range(int(T*4)):
+    #step= 200
+    for count in range(int(test_length)):
         start_time_t=time.time()
         
         # ����imu������
@@ -352,10 +495,10 @@ def reflex_(q_imu):
         (roll ,pitch,yaw)=IMU_data[0:3]/180*math.pi # ���� xy z��ת��
         print("roll pitch yaw: ",roll ,pitch,yaw)
         
-        theta_sim=goal_pos_sim[step]    
+        theta_sim=theta_sim_r[step]    
         angles_real=sim_angles_to_real(theta_sim)
         theta_tick=angles_to_tick(angles_real)
-        servos.write_all_positions(theta_tick)
+        servos.write_all_positions_smooth(theta_tick,Interpolation_num)
         # read feedback
         position_Read=servos.read_all_positions()
         position_Read_tick=angles_to_tick(position_Read)
@@ -369,14 +512,14 @@ def reflex_(q_imu):
         csv_rows.append(csv_row)
             
         
-        while (time.time()-start_time_t)*1000<20.00:
+        while (time.time()-start_time_t)*1000<100.00:
             1
         end_time_t=time.time()
         print("last time",time.time()-start_time_t,"count:",count)
            
             
         
-        if step==239:
+        if step==5239:
             step=0
         else:
             step=step+1
@@ -395,6 +538,7 @@ def reflex_(q_imu):
     data_json = json.dumps(data, cls=NumpyArrayEncoder)
     DXLn_ID=range(18)
     #servos.disable_torque(DXLn_ID)
+
     
 
 
@@ -405,13 +549,15 @@ from Servos import *
 
 if __name__ == '__main__':
     #global IMU_data 
-    file_first_name='force_real_four_'
-    file_last_name='new_36_1'
-    file_name=file_first_name+file_last_name+'.json'
-    output_file_first_name='pos_cpg_4_'
-    record_file_first_name='record_fix_cpg_4_'
-    output_file_name=record_file_first_name+file_last_name+'_test.csv'
-    tick_file_name=output_file_first_name+file_last_name+'.json'
+    folder_name='record_data/'
+    file_first_name='mine_faultc_no020_3.json'
+    file_name=folder_name+file_first_name
+    
+    output_folder='record_data_real_robot/'
+    output_first_name='real_robot_62_'
+    output_file_name=output_folder+output_first_name+file_first_name
+    
+
     
     #file_name="force_real17.json"
     #tick_file_name="pos_20_17_1.json"
@@ -420,22 +566,14 @@ if __name__ == '__main__':
         
     
     #IMU_data =np.array([1,1,1,0,0,0,1,1,1,])
-    with open(file_name, 'r') as f:
-    
-        data_read = json.load(f)
-        force_r = np.asarray(data_read['contact_force'])
-        phase_r = np.asarray(data_read['phase'])
-        cpg_r = np.asarray(data_read['cpg'])
-        theta_r = np.asarray(data_read['theta'])
-        theta_ini_r=np.asarray(data_read['theta_ini'])
-        ini_index_r=np.asarray(data_read['ini_index'])
-        #torque_n=np.asarray(data_read['torque_n'])
+with open(file_name,'r') as f:    
+    data_read = json.load(f)
+    theta_target = np.asarray(data_read['theta'])
+    theta_sim_r_old = np.asarray(data_read['theta_real_n'])
+    IMU_r = np.asarray(data_read['IMU_n'])
 
 
     step= 0
-    cpg_index=ini_index_r[0]
-    if cpg_index>240:
-        cpg_index=cpg_index-240*int(cpg_index/240)
     
     #q_imu=queue.LifoQueue()
     q_imu= Queue()

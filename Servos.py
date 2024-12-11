@@ -340,6 +340,22 @@ class Servos:
                 print(self.read_all_current())
             #position_temp=self.read_all_positions()
             #print("posoyion temp:",position_temp)
+    
+    def write_all_positions_smooth(self,dxl_goal_position,Interpolation_num):
+        # 输入角度
+        position_Read=self.read_all_positions_tick()
+        #print("position_Read",position_Read)
+        #print("dxl_goal_position",dxl_goal_position)
+
+        for j in range(Interpolation_num):
+            position_goal=np.trunc(position_Read+(dxl_goal_position-position_Read)/Interpolation_num*(j+1)) #tick
+            #print("position goal",position_goal)
+            self.write_all_positions(position_goal)
+            time.sleep(0.0001)
+            #if j%10==0:
+            #    print(self.read_all_current())
+            #position_temp=self.read_all_positions()
+            #print("posoyion temp:",position_temp)
             
     def read_voltage(self,dxl_ID):
         dxl_present_voltage, dxl_comm_result, dxl_error = self.packetHandler.read2ByteTxRx(self.portHandler, dxl_ID,
