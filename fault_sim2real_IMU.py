@@ -385,7 +385,7 @@ def read_imu(q_imu):
     )
 
     if (platform.system().lower() == 'linux'):
-        device.serialConfig.portName = "/dev/ttyUSB0"   #���ô���   Set serial port
+        device.serialConfig.portName = "/dev/ttyUSB1"   #���ô���   Set serial port
     else:
         device.serialConfig.portName = "COM39"          #���ô���   Set serial port
     device.serialConfig.baud = 230400                     #���ò�����  Set baud rate
@@ -550,11 +550,11 @@ from Servos import *
 if __name__ == '__main__':
     #global IMU_data 
     folder_name='record_data/'
-    file_first_name='mine_faultc_no020_3.json'
+    file_first_name='mine_faultc_no0150_1.json'
     file_name=folder_name+file_first_name
     
     output_folder='record_data_real_robot/'
-    output_first_name='real_robot_62_'
+    output_first_name='real_robot_64_'
     output_file_name=output_folder+output_first_name+file_first_name
     
 
