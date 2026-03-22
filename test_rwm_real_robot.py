@@ -94,6 +94,11 @@ ENABLE_ACTION_CLIP_PRINT = False
 ENABLE_JOINT_LIMIT_PRINT = False
 # ======================================================================
 
+# ------------------- Inference CPU tweaks (no model change) -------------------
+# 树莓派上可试 1~4；None 表示不调用 set_num_threads（沿用 PyTorch 默认）
+OPTIM_TORCH_NUM_THREADS = 2
+# ==============================================================================
+
 # ---------------------------
 # Ankle asymmetric mapping (sim-to-real consistency)
 # If your policy was trained in simulation with use_asymmetric_ankle_mapping=True
@@ -666,6 +671,13 @@ class RealRobotRWMInference:
         if self.model_loaded:
             self.actor_critic.eval()
 
+        # Preallocated buffers (avoid per-step torch.tensor / torch.cat)
+        self._prop_buffer = torch.zeros(1, self.obs_dim, device=self.device, dtype=torch.float32)
+        self._prev_action_buf = torch.zeros(1, 18, device=self.device, dtype=torch.float32)
+        # wm_feature_encoder 输出缓存：仅在 WM 做 obs_step 更新 wm_feature 后失效
+        self._cached_wm_latent = None
+        self._wm_latent_cache_valid = False
+
         # Initialize basic state
         self.step_count = 0
         self.wm_is_first = torch.ones(1, device=self.device)
@@ -793,7 +805,7 @@ class RealRobotRWMInference:
 
         try:
             # Use the full ActorCriticRWM model for inference
-            with torch.no_grad():
+            with torch.inference_mode():
                 # Get deterministic actions by manually constructing the actor input
                 proprioceptive_obs = obs  # obs is already proprioceptive in our case
 
@@ -808,7 +820,13 @@ class RealRobotRWMInference:
                 # Manually construct actor input like in act() method with proprioception_only=True
                 latent_vector = self.actor_critic.history_encoder(history)
                 command = proprioceptive_obs[:, 6:9]  # Extract commands from proprioceptive obs (positions 6:9)
-                wm_latent_vector = self.actor_critic.wm_feature_encoder(wm_feature)
+                # wm_feature 在非 WM 更新步不变，可复用 wm_feature_encoder 输出
+                if self._wm_latent_cache_valid and self._cached_wm_latent is not None:
+                    wm_latent_vector = self._cached_wm_latent
+                else:
+                    wm_latent_vector = self.actor_critic.wm_feature_encoder(wm_feature)
+                    self._cached_wm_latent = wm_latent_vector
+                    self._wm_latent_cache_valid = True
 
                 # Concatenate: latent_vector + command + wm_latent_vector
                 concat_observations = torch.concat((latent_vector, command, wm_latent_vector), dim=-1)
@@ -847,21 +865,27 @@ class RealRobotRWMInference:
             return self.wm_feature
 
         try:
-            with torch.no_grad():
+            with torch.inference_mode():
                 # Update action history with prev_action (like playMBRL, wm_action is history of last K actions)
                 if prev_action is None:
-                    prev_action_t = torch.zeros((1, 18), device=self.device, dtype=torch.float32)
+                    self._prev_action_buf.zero_()
                 elif isinstance(prev_action, torch.Tensor):
-                    prev_action_t = prev_action.to(self.device).to(torch.float32)
-                    if prev_action_t.dim() == 1:
-                        prev_action_t = prev_action_t.unsqueeze(0)
+                    pa = prev_action.to(self.device, dtype=torch.float32, non_blocking=False)
+                    if pa.dim() == 1:
+                        self._prev_action_buf[0].copy_(pa)
+                    else:
+                        self._prev_action_buf.copy_(pa)
                 else:
-                    prev_action_t = torch.tensor(prev_action, device=self.device, dtype=torch.float32).unsqueeze(0)
+                    self._prev_action_buf[0].copy_(
+                        torch.from_numpy(np.asarray(prev_action, dtype=np.float32))
+                    )
+                prev_action_t = self._prev_action_buf
 
-                self.wm_action_history = torch.cat(
-                    (self.wm_action_history[:, 1:], prev_action_t.unsqueeze(1)), dim=1
-                )
-                self.wm_action = self.wm_action_history.flatten(1)  # (1, K*18)
+                # 移位写入新动作（避免 torch.cat；用 clone 避免重叠内存 undefined）
+                ha = self.wm_action_history
+                ha[:, :-1] = ha[:, 1:].clone()
+                ha[:, -1, :].copy_(prev_action_t)
+                self.wm_action = ha.reshape(1, -1)
 
                 # Update world model latent every K steps (matches training update_interval)
                 if self.step_count % self.wm_update_interval == 0:
@@ -875,6 +899,8 @@ class RealRobotRWMInference:
                     )
                     self.wm_feature = self.world_model.dynamics.get_deter_feat(self.wm_latent)
                     self.wm_is_first[:] = 0
+                    # wm_feature 更新后需重算 policy 侧的 wm_latent_vector
+                    self._wm_latent_cache_valid = False
 
         except Exception as e:
             print(f"World model update error: {e}")
@@ -886,6 +912,8 @@ class RealRobotRWMInference:
     def reset(self):
         """Reset inference state"""
         self.step_count = 0
+        self._wm_latent_cache_valid = False
+        self._cached_wm_latent = None
         print("RWM inference state reset")
 
 
@@ -1458,6 +1486,11 @@ def test_rwm_real_robot(model_path):
     rwm_inference = RealRobotRWMInference(model_path, device='cpu', remove_dof_vel=remove_dof_vel)
     policy = rwm_inference.get_inference_policy()
 
+    if OPTIM_TORCH_NUM_THREADS is not None:
+        try:
+            torch.set_num_threads(int(OPTIM_TORCH_NUM_THREADS))
+        except Exception:
+            pass
 
     # Initialize real robot components
     print("📍 Step 1: Initializing Servos...")
@@ -1564,6 +1597,9 @@ def test_rwm_real_robot(model_path):
     history_length = 5
     obs_without_command_dim = (42 if remove_dof_vel else 60) + (6 if cpg_reward else 0)
     history_dim = obs_without_command_dim * history_length
+    # 复用 history 张量，避免每步 torch.tensor 分配
+    history_tensor_buf = torch.zeros(1, history_dim, dtype=torch.float32, device='cpu')
+    action_scale_t = torch.as_tensor(ACTION_SCALE_PER_DIM, dtype=torch.float32, device='cpu')
     trajectory_history = deque(maxlen=history_length)
 
     # Initialize with zeros
@@ -1707,9 +1743,12 @@ def test_rwm_real_robot(model_path):
                 with open('./validation_outputs/real_obs_test_rwm_real_robot.txt', 'a') as f:
                     f.write(str(real_obs) + '\n')
 
-                # Prepare observation dict for world model
+                # Prepare observation dict for world model（复用 prop buffer）
+                rwm_inference._prop_buffer[0].copy_(
+                    torch.from_numpy(np.asarray(proprioceptive_obs, dtype=np.float32))
+                )
                 obs_dict = {
-                    "prop": torch.tensor(proprioceptive_obs, dtype=torch.float32).unsqueeze(0).to('cpu'),
+                    "prop": rwm_inference._prop_buffer,
                     "is_first": rwm_inference.wm_is_first,
                 }
 
@@ -1721,7 +1760,8 @@ def test_rwm_real_robot(model_path):
                 # Prepare history
                 policy_start_pc = time.perf_counter()
                 history_flat = np.concatenate(list(trajectory_history))
-                history_tensor = torch.tensor(history_flat, dtype=torch.float32).unsqueeze(0).to('cpu')
+                history_tensor_buf[0].copy_(torch.from_numpy(history_flat.astype(np.float32)))
+                history_tensor = history_tensor_buf
 
                 # Log policy-related inputs for visualization: command, history (pre-encoder), wm_feature
                 prop = obs_dict["prop"].detach().cpu().numpy()
@@ -1746,14 +1786,11 @@ def test_rwm_real_robot(model_path):
                 action_raw_np = actions.detach().cpu().numpy().flatten()
                 action_for_obs = np.clip(action_raw_np, action_limits['min'], action_limits['max'])
 
-                # Apply per-dimension action scaling for safety
-                scale_t = torch.as_tensor(
-                    ACTION_SCALE_PER_DIM, dtype=actions.dtype, device=actions.device
-                )
+                # Apply per-dimension action scaling for safety（复用预构建 scale，CPU float32）
                 if actions.dim() == 2:
-                    actions = actions * scale_t.unsqueeze(0)
+                    actions = actions * action_scale_t.unsqueeze(0)
                 else:
-                    actions = actions * scale_t
+                    actions = actions * action_scale_t
 
                 # Convert actions (for execution)
                 action_np = actions.detach().cpu().numpy().flatten()
