@@ -243,7 +243,7 @@ def read_imu(q_imu):
     )
 
     if (platform.system().lower() == 'linux'):
-        device.serialConfig.portName = "/dev/ttyUSB0"   #���ô���   Set serial port
+        device.serialConfig.portName = '/dev/serial/by-id/usb-1a86_USB2.0-Ser_-if00-port0'#"/dev/ttyUSB0"   #���ô���   Set serial port
     else:
         device.serialConfig.portName = "COM39"          #���ô���   Set serial port
     device.serialConfig.baud = 230400                     #���ò�����  Set baud rate
@@ -289,6 +289,9 @@ def reflex_(q_imu):
     
     theta_sim=goal_pos_sim[step]    
     angles_real=sim_angles_to_real(theta_sim)
+    # 将initialize角度保存到文件
+    with open('./validation_outputs/initialize_angles_CPGs_sim_2_real_IMU_new.txt', 'a') as f:
+        f.write(str(angles_real) + '\n')
     servos.Robot_initialize(angles_real)
     goal_theta_tick=angles_to_tick(angles_real)
     time.sleep(1)
@@ -354,8 +357,14 @@ def reflex_(q_imu):
         
         theta_sim=goal_pos_sim[step]    
         angles_real=sim_angles_to_real(theta_sim)
+        # 将angles_real写入文件
+        with open('./validation_outputs/angles_real_CPGs_sim_2_real_IMU_new.txt', 'a') as f:
+            f.write(str(angles_real) + '\n')
         theta_tick=angles_to_tick(angles_real)
         servos.write_all_positions(theta_tick)
+        # 将write_all_positions的theta_tick写入文件
+        with open('./validation_outputs/theta_tick_CPGs_sim_2_real_IMU_new.txt', 'a') as f:
+            f.write(str(theta_tick) + '\n')
         # read feedback
         position_Read=servos.read_all_positions()
         position_Read_tick=angles_to_tick(position_Read)
@@ -374,7 +383,8 @@ def reflex_(q_imu):
         end_time_t=time.time()
         print("last time",time.time()-start_time_t,"count:",count)
            
-            
+        velocity=servos.read_all_velocity()
+        print("velocity:",velocity)
         
         if step==239:
             step=0
@@ -410,11 +420,13 @@ if __name__ == '__main__':
     file_name=file_first_name+file_last_name+'.json'
     output_file_first_name='pos_cpg_4_'
     record_file_first_name='record_fix_cpg_4_'
-    output_file_name=record_file_first_name+file_last_name+'_test.csv'
+    output_file_name=record_file_first_name+file_last_name+'_test_mbrl_supergrass.csv'
     tick_file_name=output_file_first_name+file_last_name+'.json'
     
-    #file_name="force_real17.json"
-    #tick_file_name="pos_20_17_1.json"
+    # file_name="force_real17.json"
+    tick_file_name="pos_20_17_3.json"
+    #tick_file_name="pos_cpg_4_new_36_1.json"
+    # tick_file_name="pos_cpg_5_new_17_3.json"
     #output_file_name='record_fix_new_cpg_3_3.csv'
     
         

@@ -1,0 +1,2178 @@
+# Real robot RWM inference - Simplified for deployment
+import os
+import time
+import math
+import platform
+import torch
+import numpy as np
+from collections import deque
+import sys
+import contextlib
+
+# Real robot hardware imports
+import lib.device_model as deviceModel
+from lib.data_processor.roles.jy901s_dataProcessor import JY901SDataProcessor
+from lib.protocol_resolver.roles.wit_protocol_resolver import WitProtocolResolver
+from Servos import *
+from set_imu import *
+from utils import *
+from reflex_related import *
+from robot_config import ROBOT_CONFIG, real_to_sim_angles, sim_to_real_angles, angles_to_ticks, ticks_to_angles
+from multiprocessing import Process, Queue
+
+# Import RWM model components
+from world_model.actor_cirtic_rwm import ActorCriticRWM
+
+
+# ==================== PORT ERROR DETECTION ====================
+class PortErrorDetector:
+    """Detects 'Port is in use' error and raises exception immediately"""
+    def __init__(self):
+        self.original_stdout = sys.stdout
+        self.original_stderr = sys.stderr
+        self.enabled = True  # Flag to enable/disable detection
+        
+    def write(self, text):
+        """Write to original output and check for port error"""
+        self.original_stdout.write(text)
+        # Only check if enabled and not during cleanup
+        if self.enabled and "Port is in use" in text and "[TxRxResult]" in text:
+            self.original_stdout.write("\n" + "="*60 + "\n")
+            self.original_stdout.write("❌ CRITICAL: Port is in use error detected!\n")
+            self.original_stdout.write("="*60 + "\n")
+            self.original_stdout.flush()
+            # Disable further detection to avoid cascade
+            self.enabled = False
+            raise RuntimeError("PORT_IN_USE_ERROR: Port is in use!")
+            
+    def flush(self):
+        self.original_stdout.flush()
+        
+    def disable(self):
+        """Disable error detection (for cleanup phase)"""
+        self.enabled = False
+        
+    def enable(self):
+        """Re-enable error detection"""
+        self.enabled = True
+
+# Install port error detector
+port_detector = PortErrorDetector()
+sys.stdout = port_detector
+# ============================================================
+
+
+INTERPOLATION_STEPS = 1 # Simplified: no interpolation like CPGs
+TARGET_DT = 0.02  # 20ms = 50Hz like CPGs for higher control frequency
+MAX_STEPS = 1000
+# 策略输出逐维缩放（与 action 索引一致）：
+# [0:3] l1_bc,l1_cf,l1_ft  [3:6] l2  [6:9] l3  [9:12] r1  [12:15] r2  [15:18] r3
+ACTION_SCALE_PER_DIM = np.array(
+    [
+        0.15, 0.15, 0.15,  # l1
+        0.15, 0.15, 0.15,  # l2
+        0.15, 0.15, 0.15,  # l3
+        0.15, 0.15, 0.15,  # r1
+        0.15, 0.15, 0.15,  # r2
+        0.15, 0.15, 0.15,  # r3
+    ],
+    dtype=np.float32,
+)
+cpg_reward = True
+remove_dof_vel = True  # when True: remove dof_vel(18) from observation/history
+USE_ADMITTANCE = False  # Enable/disable admittance filter
+
+# ==================== Performance / Logging Switches ====================
+# 控制台打印尽量关掉，减少 I/O 对控制周期的影响；
+# 时间拆段计时保留，用于定位瓶颈。
+ENABLE_CONTROL_PRINT = False  # 关掉大多数运行时打印（仅保留关键错误/计时报告）
+ENABLE_TIMING_REPORT = True
+TIMING_REPORT_EVERY_N_STEPS = 50
+LOG_FLUSH_EVERY_N_STEPS = 20  # 降低 flush 频率，减少文件 I/O 抖动
+# 下面这些“每步大段打印”非常耗时，默认关闭
+ENABLE_ACTION_CLIP_PRINT = False
+ENABLE_JOINT_LIMIT_PRINT = False
+# ======================================================================
+
+# ---------------------------
+# Ankle asymmetric mapping (sim-to-real consistency)
+# If your policy was trained in simulation with use_asymmetric_ankle_mapping=True
+# (see world_model/hexapodMBRL.py), enable this to match the same semantics on real robot.
+# ---------------------------
+USE_ASYMMETRIC_ANKLE_MAPPING = True
+# Ranges are in radians around the neutral (0) pose in sim joint space.
+# Positive direction means "lift" after alignment (left ankles: +, right ankles: -).
+ASYM_ANKLE_LIFT_RANGE_RAD = 1.0
+ASYM_ANKLE_SINK_RANGE_RAD = 0.10
+
+
+def apply_asymmetric_ankle_mapping_rad(actions_rad, lift_range_rad=1.0, sink_range_rad=0.10):
+    """
+    Apply asymmetric ankle mapping like hexapodMBRL._apply_asymmetric_ankle_mapping, but in *radians*.
+
+    We interpret `actions_rad` as desired joint offsets in sim joint space (rad) around the neutral pose.
+    For the 6 ankle joints, the "lift" direction is:
+      - left ankles (2,5,8): +rad
+      - right ankles (11,14,17): -rad
+
+    Mapping: large range for lift, small range for sink.
+    """
+    a = np.array(actions_rad, dtype=np.float32, copy=True)
+    ankle_idx = np.array([2, 5, 8, 11, 14, 17], dtype=np.int64)
+    # lift_dir aligns "lift" to positive
+    lift_dir = np.array([1, 1, 1, -1, -1, -1], dtype=np.float32)
+    lift_range_rad = float(max(lift_range_rad, 0.0))
+    sink_range_rad = float(max(sink_range_rad, 0.0))
+    if lift_range_rad == 0.0 and sink_range_rad == 0.0:
+        return a
+
+    ankle = a[ankle_idx]
+    aligned = ankle * lift_dir
+    # Normalize by lift range so +side can reach lift_range; clamp to [-1, 1]
+    denom = lift_range_rad if lift_range_rad > 1e-6 else 1e-6
+    aligned_n = np.clip(aligned / denom, -1.0, 1.0)
+    mapped_aligned = np.where(aligned_n >= 0.0, aligned_n * lift_range_rad, aligned_n * sink_range_rad)
+    mapped = mapped_aligned * lift_dir
+    a[ankle_idx] = mapped
+    return a
+
+
+# 定义弧度转角度函数
+def radians_to_degrees(radians):
+    return radians * 180.0 / math.pi
+
+def interpolate_actions(prev_actions, current_actions, alpha):
+    """
+    Linear interpolation between previous and current actions for smooth transitions.
+
+    Args:
+        prev_actions: Previous action array (18,)
+        current_actions: Current action array (18,)
+        alpha: Interpolation factor (0.0 = prev_actions, 1.0 = current_actions)
+
+    Returns:
+        interpolated_actions: Smoothed action array
+    """
+    if prev_actions is None:
+        return current_actions
+    return prev_actions + alpha * (current_actions - prev_actions)
+
+def servo_angles_to_sim_angles(servo_angles_deg):
+    """
+    Convert servo angles (degrees) to simulation joint angles (radians) that match action ranges.
+
+    Args:
+        servo_angles_deg: 18-dim array of servo angles in degrees
+                         Order: [l1_hip, l1_knee, l1_ankle, r1_hip, r1_knee, r1_ankle,
+                                l2_hip, l2_knee, l2_ankle, r2_hip, r2_knee, r2_ankle,
+                                l3_hip, l3_knee, l3_ankle, r3_hip, r3_knee, r3_ankle]
+
+    Returns:
+        sim_angles_rad: 18-dim array of simulation joint angles in radians
+                        Order: [l1_hip, l1_knee, l1_ankle, l2_hip, l2_knee, l2_ankle,
+                               l3_hip, l3_knee, l3_ankle, r1_hip, r1_knee, r1_ankle,
+                               r2_hip, r2_knee, r2_ankle, r3_hip, r3_knee, r3_ankle]
+    """
+    # Initialize simulation angles array
+    sim_angles_deg = np.zeros(18)
+
+    # Reorder from servo order to simulation order and apply inverse mappings
+    # Servo indices:  0-2:l1, 3-5:r1, 6-8:l2, 9-11:r2, 12-14:l3, 15-17:r3
+    # Sim indices:    0-2:l1, 3-5:l2, 6-8:l3, 9-11:r1, 12-14:r2, 15-17:r3
+
+    # l1 leg (servo 0-2 -> sim 0-2)
+    # Hip joint: servo = 180 - action_deg => action_deg = 180 - servo
+    sim_angles_deg[0] = 180.0 - servo_angles_deg[0]
+    # Knee joint: servo = 180 - action_deg => action_deg = 180 - servo (left leg)
+    sim_angles_deg[1] = 180.0 - servo_angles_deg[1]
+    # Ankle joint: servo = 60 + action_deg => action_deg = servo - 60 (left leg)
+    sim_angles_deg[2] = servo_angles_deg[2] - 60.0
+
+    # l2 leg (servo 6-8 -> sim 3-5)
+    # Hip joint: servo = 180 - action_deg => action_deg = 180 - servo
+    sim_angles_deg[3] = 180.0 - servo_angles_deg[6]
+    # Knee joint: servo = 180 - action_deg => action_deg = 180 - servo (left leg)
+    sim_angles_deg[4] = 180.0 - servo_angles_deg[7]
+    # Ankle joint: servo = 60 + action_deg => action_deg = servo - 60 (left leg)
+    sim_angles_deg[5] = servo_angles_deg[8] - 60.0
+
+    # l3 leg (servo 12-14 -> sim 6-8)
+    # Hip joint: servo = 180 - action_deg => action_deg = 180 - servo
+    sim_angles_deg[6] = 180.0 - servo_angles_deg[12]
+    # Knee joint: servo = 180 - action_deg => action_deg = 180 - servo (left leg)
+    sim_angles_deg[7] = 180.0 - servo_angles_deg[13]
+    # Ankle joint: servo = 60 + action_deg => action_deg = servo - 60 (left leg)
+    sim_angles_deg[8] = servo_angles_deg[14] - 60.0
+
+    # r1 leg (servo 3-5 -> sim 9-11)
+    # Hip:   servo = 180 - sim → sim = 180 - servo
+    sim_angles_deg[9] = 180.0 - servo_angles_deg[3]
+    # Knee:  servo = 180 - sim → sim = 180 - servo
+    sim_angles_deg[10] = 180.0 - servo_angles_deg[4]
+    # Ankle: servo = 60  - sim → sim = 60  - servo
+    sim_angles_deg[11] = 60.0 - servo_angles_deg[5]
+
+    # r2 leg (servo 9-11 -> sim 12-14)
+    sim_angles_deg[12] = 180.0 - servo_angles_deg[9]
+    sim_angles_deg[13] = 180.0 - servo_angles_deg[10]
+    sim_angles_deg[14] = 60.0 - servo_angles_deg[11]
+
+    # r3 leg (servo 15-17 -> sim 15-17)
+    sim_angles_deg[15] = 180.0 - servo_angles_deg[15]
+    sim_angles_deg[16] = 180.0 - servo_angles_deg[16]
+    sim_angles_deg[17] = 60.0 - servo_angles_deg[17]
+
+    # Convert to radians
+    sim_angles_rad = np.radians(sim_angles_deg)
+
+    return sim_angles_rad
+
+
+def sim_angles_rad_to_servo_angles_deg(sim_angles_rad):
+    """
+    Convert simulation joint angles (radians, sim order) to servo angles (degrees, servo order).
+    Inverse of servo_angles_to_sim_angles. Used when replaying sim dof_pos.
+
+    Args:
+        sim_angles_rad: 18-dim array in sim order [l1_bc,l1_cf,l1_ft, l2,l2,l2, l3,l3,l3, r1,r1,r1, r2,r2,r2, r3,r3,r3] (radians)
+
+    Returns:
+        servo_angles_deg: 18-dim array in servo order [l1,l1,l1, r1,r1,r1, l2,l2,l2, r2,r2,r2, l3,l3,l3, r3,r3,r3] (degrees)
+    """
+    sim_deg = np.degrees(sim_angles_rad)
+    servo = np.zeros(18)
+    # l1 (sim 0-2 -> servo 0-2)
+    servo[0] = 180.0 - sim_deg[0]
+    servo[1] = 180.0 - sim_deg[1]
+    servo[2] = sim_deg[2] + 60.0
+    # l2 (sim 3-5 -> servo 6-8)
+    servo[6] = 180.0 - sim_deg[3]
+    servo[7] = 180.0 - sim_deg[4]
+    servo[8] = sim_deg[5] + 60.0
+    # l3 (sim 6-8 -> servo 12-14)
+    servo[12] = 180.0 - sim_deg[6]
+    servo[13] = 180.0 - sim_deg[7]
+    servo[14] = sim_deg[8] + 60.0
+    # r1 (sim 9-11 -> servo 3-5)
+    servo[3] = 180.0 - sim_deg[9]
+    servo[4] = 180.0 - sim_deg[10]   # right knee: servo = 180 - sim
+    servo[5] = 60.0 - sim_deg[11]
+    # r2 (sim 12-14 -> servo 9-11)
+    servo[9] = 180.0 - sim_deg[12]
+    servo[10] = 180.0 - sim_deg[13]  # right knee: servo = 180 - sim
+    servo[11] = 60.0 - sim_deg[14]
+    # r3 (sim 15-17 -> servo 15-17)
+    servo[15] = 180.0 - sim_deg[15]
+    servo[16] = 180.0 - sim_deg[16]  # right knee: servo = 180 - sim
+    servo[17] = 60.0 - sim_deg[17]
+    return servo
+
+
+def load_sim_dof_pos(filepath):
+    """
+    Load dof_pos (18-dim, sim order, radians) from each line of wm_obs_prop-style file.
+    Each line is one observation block [[ ... ]]; layout: [0:3] base_ang_vel, [3:6] projected_gravity,
+    [6:9] commands, [9:27] dof_pos (18 values).
+
+    Returns:
+        list of np.ndarray of shape (18,) in radians, sim order.
+    """
+    import re
+    out = []
+    with open(filepath, 'r') as f:
+        content = f.read()
+    # Split by "]]" to get each observation block (then take content before last "]" of block)
+    blocks = re.split(r'\]\s*\]', content)
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        # Remove leading "[["
+        block = re.sub(r'^\s*\[\s*\[\s*', '', block)
+        if not block:
+            continue
+        # Extract all floats
+        nums = re.findall(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', block)
+        nums = [float(x) for x in nums]
+        if len(nums) < 27:
+            continue
+        dof_pos = np.array(nums[9:27], dtype=np.float64)
+        out.append(dof_pos)
+    return out
+
+
+def get_action_limits():
+    """
+    Calculate the safe action limits in radians to prevent servo angle clipping.
+    Based on the action_to_servo_angles mapping and servo angle limits.
+
+    Returns:
+        action_limits: dict with 'min' and 'max' arrays for each action dimension (in radians)
+    """
+    # Get servo angle limits from config (degrees)
+    servo_min = ROBOT_CONFIG['angle_limits']['min']
+    servo_max = ROBOT_CONFIG['angle_limits']['max']
+
+    # Initialize action limits arrays (in degrees first, then convert to radians)
+    action_min_deg = np.zeros(18)
+    action_max_deg = np.zeros(18)
+
+    # Based on action_to_servo_angles mapping:
+    # Hip joints: servo = 180 - action_deg => action_deg = 180 - servo
+    # Left knee: servo = 180 - action_deg => action_deg = 180 - servo
+    # Right knee: servo = 180 - action_deg => action_deg = 180 - servo
+    # Left ankle: servo = 60 + action_deg => action_deg = servo - 60
+    # Right ankle: servo = 60 - action_deg => action_deg = 60 - servo
+
+    # Action indices: 0-2:l1, 3-5:l2, 6-8:l3, 9-11:r1, 12-14:r2, 15-17:r3
+    # Servo indices:  0-2:l1, 3-5:r1, 6-8:l2, 9-11:r2, 12-14:l3, 15-17:r3
+
+    # Initialize with raw limits (will be adjusted with safety margins below)
+    # l1 leg actions (0-2) -> servo indices (0-2)
+    action_min_deg[0] = 180.0 - servo_max[0]  # Hip
+    action_max_deg[0] = 180.0 - servo_min[0]
+    action_min_deg[1] = 180.0 - servo_max[1]  # Left knee
+    action_max_deg[1] = 180.0 - servo_min[1]
+    action_min_deg[2] = servo_min[2] - 60.0   # Left ankle
+    action_max_deg[2] = servo_max[2] - 60.0
+
+    # l2 leg actions (3-5) -> servo indices (6-8)
+    action_min_deg[3] = 180.0 - servo_max[6]  # Hip
+    action_max_deg[3] = 180.0 - servo_min[6]
+    action_min_deg[4] = 180.0 - servo_max[7]  # Left knee
+    action_max_deg[4] = 180.0 - servo_min[7]
+    action_min_deg[5] = servo_min[8] - 60.0   # Left ankle
+    action_max_deg[5] = servo_max[8] - 60.0
+
+    # l3 leg actions (6-8) -> servo indices (12-14)
+    action_min_deg[6] = 180.0 - servo_max[12]  # Hip
+    action_max_deg[6] = 180.0 - servo_min[12]
+    action_min_deg[7] = 180.0 - servo_max[13]  # Left knee
+    action_max_deg[7] = 180.0 - servo_min[13]
+    action_min_deg[8] = servo_min[14] - 60.0   # Left ankle
+    action_max_deg[8] = servo_max[14] - 60.0
+
+    # r1 leg actions (9-11) -> servo indices (3-5)
+    action_min_deg[9] = 180.0 - servo_max[3]   # Hip: servo=180-sim → sim=180-servo
+    action_max_deg[9] = 180.0 - servo_min[3]
+    action_min_deg[10] = 180.0 - servo_max[4]   # Right knee: servo=180-sim → sim=180-servo
+    action_max_deg[10] = 180.0 - servo_min[4]
+    action_min_deg[11] = 60.0 - servo_max[5]   # Right ankle
+    action_max_deg[11] = 60.0 - servo_min[5]
+
+    # r2 leg actions (12-14) -> servo indices (9-11)
+    action_min_deg[12] = 180.0 - servo_max[9]  # Hip
+    action_max_deg[12] = 180.0 - servo_min[9]
+    action_min_deg[13] = 180.0 - servo_max[10]  # Right knee
+    action_max_deg[13] = 180.0 - servo_min[10]
+    action_min_deg[14] = 60.0 - servo_max[11]  # Right ankle
+    action_max_deg[14] = 60.0 - servo_min[11]
+
+    # r3 leg actions (15-17) -> servo indices (15-17)
+    action_min_deg[15] = 180.0 - servo_max[15] # Hip
+    action_max_deg[15] = 180.0 - servo_min[15]
+    action_min_deg[16] = 180.0 - servo_max[16]  # Right knee
+    action_max_deg[16] = 180.0 - servo_min[16]
+    action_min_deg[17] = 60.0 - servo_max[17]  # Right ankle
+    action_max_deg[17] = 60.0 - servo_min[17]
+
+    # Convert to radians
+    action_min_rad = np.radians(action_min_deg)
+    action_max_rad = np.radians(action_max_deg)
+
+    # Add safety margin to ensure servo angles stay strictly within limits
+    safety_margin_deg = 2.0  # 2.0 degree safety margin for reliability
+    safety_margin_rad = np.radians(safety_margin_deg)
+
+    # Apply safety margins to all action limits
+    # For hip joints (servo = 180 - action): smaller action -> larger servo
+    # Map action indices to servo indices for hip joints
+    hip_action_to_servo = {0: 0, 3: 6, 6: 12, 9: 3, 12: 9, 15: 15}
+    for action_idx, servo_idx in hip_action_to_servo.items():
+        # To ensure servo <= servo_max - margin, action >= 180 - (servo_max - margin)
+        action_min_deg[action_idx] = 180.0 - (servo_max[servo_idx] - safety_margin_deg)
+        # To ensure servo >= servo_min + margin, action <= 180 - (servo_min + margin)
+        action_max_deg[action_idx] = 180.0 - (servo_min[servo_idx] + safety_margin_deg)
+
+    # For left knee joints (same as hip: servo = 180 - action)
+    # Map action indices to servo indices for left knee joints
+    left_knee_action_to_servo = {1: 1, 4: 7, 7: 13}  # l1, l2, l3 knees
+    for action_idx, servo_idx in left_knee_action_to_servo.items():
+        action_min_deg[action_idx] = 180.0 - (servo_max[servo_idx] - safety_margin_deg)
+        action_max_deg[action_idx] = 180.0 - (servo_min[servo_idx] + safety_margin_deg)
+
+    # For right knee joints (servo = 180 - action): larger action -> smaller servo
+    right_knee_action_to_servo = {10: 4, 13: 10, 16: 16}  # r1, r2, r3 knees
+    for action_idx, servo_idx in right_knee_action_to_servo.items():
+        # To ensure servo <= servo_max - margin, action >= 180 - (servo_max - margin)
+        action_min_deg[action_idx] = 180.0 - (servo_max[servo_idx] - safety_margin_deg)
+        # To ensure servo >= servo_min + margin, action <= 180 - (servo_min + margin)
+        action_max_deg[action_idx] = 180.0 - (servo_min[servo_idx] + safety_margin_deg)
+
+    # For left ankle joints (servo = 60 + action): larger action -> larger servo
+    # Map action indices to servo indices for left ankle joints
+    left_ankle_action_to_servo = {2: 2, 5: 8, 8: 14}  # l1, l2, l3 ankles
+    for action_idx, servo_idx in left_ankle_action_to_servo.items():
+        # To ensure servo >= servo_min + margin, action >= (servo_min + margin) - 60
+        action_min_deg[action_idx] = (servo_min[servo_idx] + safety_margin_deg) - 60.0
+        # To ensure servo <= servo_max - margin, action <= (servo_max - margin) - 60
+        action_max_deg[action_idx] = (servo_max[servo_idx] - safety_margin_deg) - 60.0
+
+    # For right ankle joints (servo = 60 - action): smaller action -> larger servo
+    # Map action indices to servo indices for right ankle joints
+    right_ankle_action_to_servo = {11: 5, 14: 11, 17: 17}  # r1, r2, r3 ankles
+    for action_idx, servo_idx in right_ankle_action_to_servo.items():
+        # To ensure servo <= servo_max - margin, action >= 60 - (servo_max - margin)
+        action_min_deg[action_idx] = 60.0 - (servo_max[servo_idx] - safety_margin_deg)
+        # To ensure servo >= servo_min + margin, action <= 60 - (servo_min + margin)
+        action_max_deg[action_idx] = 60.0 - (servo_min[servo_idx] + safety_margin_deg)
+
+    # Convert to radians
+    action_min_rad = np.radians(action_min_deg)
+    action_max_rad = np.radians(action_max_deg)
+
+    return {
+        'min': action_min_rad,
+        'max': action_max_rad,
+        'min_deg': action_min_deg,
+        'max_deg': action_max_deg
+    }
+
+def action_to_servo_angles(actions_radians):
+    """
+    Convert policy actions (radians) to servo angles (degrees) with proper mapping.
+
+    Args:
+        actions_radians: 18-dim array of actions in radians
+                        Order: [l1_hip, l1_knee, l1_ankle, l2_hip, l2_knee, l2_ankle,
+                               l3_hip, l3_knee, l3_ankle, r1_hip, r1_knee, r1_ankle,
+                               r2_hip, r2_knee, r2_ankle, r3_hip, r3_knee, r3_ankle]
+
+    Returns:
+        servo_angles: 18-dim array of servo angles in degrees
+                      Order: [l1_hip, l1_knee, l1_ankle, r1_hip, r1_knee, r1_ankle,
+                             l2_hip, l2_knee, l2_ankle, r2_hip, r2_knee, r2_ankle,
+                             l3_hip, l3_knee, l3_ankle, r3_hip, r3_knee, r3_ankle]
+    """
+    # Convert actions to degrees
+    actions_deg = radians_to_degrees(actions_radians)
+
+    # Initialize servo angles array
+    servo_angles = np.zeros(18)
+
+    # Reorder from action order to servo order and apply joint-specific mappings
+    # Action indices: 0-2:l1, 3-5:l2, 6-8:l3, 9-11:r1, 12-14:r2, 15-17:r3
+    # Servo indices:  0-2:l1, 3-5:r1, 6-8:l2, 9-11:r2, 12-14:l3, 15-17:r3
+
+    # l1 leg (action 0-2 -> servo 0-2)
+    # Hip joint (idx 0): action=0 -> 180°, positive action -> smaller angle
+    servo_angles[0] = 180.0 - actions_deg[0]
+    # Knee joint (idx 1): left leg, action=-90° -> 270°, action increase -> angle decrease
+    servo_angles[1] = 270.0 - (actions_deg[1] + 90.0)
+    # Ankle joint (idx 2): left leg, action=90° -> 150°, action increase -> angle increase
+    servo_angles[2] = 150.0 + (actions_deg[2] - 90.0)
+
+    # r1 leg (action 9-11 -> servo 3-5)
+    # Hip joint (idx 3): sim decreasing=positive, real increasing=positive → servo = 180 - sim
+    servo_angles[3] = 180.0 - actions_deg[9]
+    # Knee joint (idx 4): real knee positive = angle decreases → servo = 180 - sim
+    servo_angles[4] = 180.0 - actions_deg[10]
+    # Ankle joint (idx 5): sim decreasing=positive, real increasing=positive → servo = 60 - sim
+    servo_angles[5] = 150.0 - (actions_deg[11] + 90.0)
+
+    # l2 leg (action 3-5 -> servo 6-8)
+    # Hip joint (idx 6): action=0 -> 180°, positive action -> smaller angle
+    servo_angles[6] = 180.0 - actions_deg[3]
+    # Knee joint (idx 7): left leg, action=-90° -> 270°, action increase -> angle decrease
+    servo_angles[7] = 270.0 - (actions_deg[4] + 90.0)
+    # Ankle joint (idx 8): left leg, action=90° -> 150°, action increase -> angle increase
+    servo_angles[8] = 150.0 + (actions_deg[5] - 90.0)
+
+    # r2 leg (action 12-14 -> servo 9-11)
+    # Hip joint (idx 9): sim decreasing=positive, real increasing=positive → servo = 180 - sim
+    servo_angles[9] = 180.0 - actions_deg[12]
+    # Knee joint (idx 10): real knee positive = angle decreases → servo = 180 - sim
+    servo_angles[10] = 180.0 - actions_deg[13]
+    # Ankle joint (idx 11): sim decreasing=positive, real increasing=positive → servo = 60 - sim
+    servo_angles[11] = 150.0 - (actions_deg[14] + 90.0)
+
+    # l3 leg (action 6-8 -> servo 12-14)
+    # Hip joint (idx 12): action=0 -> 180°, positive action -> smaller angle
+    servo_angles[12] = 180.0 - actions_deg[6]
+    # Knee joint (idx 13): left leg, action=-90° -> 270°, action increase -> angle decrease
+    servo_angles[13] = 270.0 - (actions_deg[7] + 90.0)
+    # Ankle joint (idx 14): left leg, action=90° -> 150°, action increase -> angle increase
+    servo_angles[14] = 150.0 + (actions_deg[8] - 90.0)
+
+    # r3 leg (action 15-17 -> servo 15-17)
+    # Hip joint (idx 15): sim decreasing=positive, real increasing=positive → servo = 180 - sim
+    servo_angles[15] = 180.0 - actions_deg[15]
+    # Knee joint (idx 16): real knee positive = angle decreases → servo = 180 - sim
+    servo_angles[16] = 180.0 - actions_deg[16]
+    # Ankle joint (idx 17): sim decreasing=positive, real increasing=positive → servo = 60 - sim
+    servo_angles[17] = 150.0 - (actions_deg[17] + 90.0)
+
+    return servo_angles
+
+
+class AdmittanceFilter:
+    """Admittance controller to smooth desired joint actions."""
+    def __init__(self, m, d, k, dt, num_joints):
+        self.m = m
+        self.d = d
+        self.k = k
+        self.dt = dt
+        self.num_joints = num_joints
+        self.q = np.zeros(num_joints, dtype=np.float32)
+        self.qd = np.zeros(num_joints, dtype=np.float32)
+        self.initialized = False
+
+    def reset(self, q_desired):
+        self.q = q_desired.astype(np.float32).copy()
+        self.qd = np.zeros(self.num_joints, dtype=np.float32)
+        self.initialized = True
+
+    def update(self, q_desired):
+        q_desired = q_desired.astype(np.float32)
+        if not self.initialized:
+            self.reset(q_desired)
+            return self.q.copy()
+
+        # m*qdd + d*qd + k*(q - q_des) = 0
+        qdd = (self.k * (q_desired - self.q) - self.d * self.qd) / self.m
+        self.qd = self.qd + qdd * self.dt
+        self.q = self.q + self.qd * self.dt
+        return self.q.copy()
+
+class RealRobotRWMInference:
+    """Simplified RWM inference for real robot deployment"""
+
+    def __init__(self, model_path=None, device='cpu', remove_dof_vel=False):
+        """
+        RWM inference for real robot deployment with full model architecture.
+
+        Args:
+            model_path: Path to trained model
+            device: Device to run inference on
+        """
+        self.device = device
+        self.remove_dof_vel = remove_dof_vel
+        print(f"Initializing RWM inference on device: {device}")
+
+        # Model configuration (matching the actual checkpoint parameters)
+        base_obs_dim = 27 if self.remove_dof_vel else 45  # without dof_vel(18)
+        self.obs_dim = base_obs_dim + (6 if cpg_reward else 0)  # proprioceptive obs dimension
+        self.num_actions = 18
+
+        # Load the trained model
+        if model_path and os.path.exists(model_path):
+            print(f"Loading model from: {model_path}")
+            try:
+                checkpoint = torch.load(model_path, map_location=device)
+
+                # Load model state dict
+                state_dict = checkpoint['model_state_dict']
+
+                # Handle DDP model state dict (remove 'module.' prefix if present)
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith('module.'):
+                        new_state_dict[k[7:]] = v  # Remove 'module.' prefix
+                    else:
+                        new_state_dict[k] = v
+
+                # Infer key dims from checkpoint to support different obs layouts (e.g. remove_dof_vel)
+                inferred_history_dim = new_state_dict.get('history_encoder.0.weight', torch.empty(0, 0)).shape[1] or 330
+                inferred_latent_dim = new_state_dict.get('history_encoder.4.weight', torch.empty(0, 0)).shape[0] or 35
+                inferred_wm_feature_dim = new_state_dict.get('wm_feature_encoder.0.weight', torch.empty(0, 0)).shape[1] or 512
+                inferred_wm_latent_dim = new_state_dict.get('wm_feature_encoder.4.weight', torch.empty(0, 0)).shape[0] or 32
+                critic_in = new_state_dict.get('critic.0.weight', torch.empty(0, 0)).shape[1]
+                inferred_num_critic_obs = (critic_in - inferred_wm_latent_dim) if critic_in else 246
+
+                self.history_dim = int(inferred_history_dim)
+                self.wm_feature_dim = int(inferred_wm_feature_dim)
+
+                # Build model with inferred dims
+                self.actor_critic = ActorCriticRWM(
+                    num_actor_obs=self.obs_dim,
+                    num_critic_obs=int(inferred_num_critic_obs),
+                    num_actions=self.num_actions,
+                    encoder_hidden_dims=[256, 128],
+                    wm_encoder_hidden_dims=[64, 64],
+                    actor_hidden_dims=[256, 128, 64],
+                    critic_hidden_dims=[512, 256, 128],
+                    activation='elu',
+                    init_noise_std=1.0,
+                    latent_dim=int(inferred_latent_dim),
+                    wm_latent_dim=int(inferred_wm_latent_dim),
+                    cpg_reward_enabled=cpg_reward,
+                    history_dim=self.history_dim,
+                    wm_feature_dim=self.wm_feature_dim
+                ).to(device)
+
+                # Load the cleaned state dict with strict=False to handle dimension mismatches
+                missing_keys, unexpected_keys = self.actor_critic.load_state_dict(new_state_dict, strict=False)
+
+                if missing_keys:
+                    print(f"Warning: Missing keys in state dict: {len(missing_keys)} keys")
+                    print(f"First few missing: {missing_keys[:3]}")
+                if unexpected_keys:
+                    print(f"Warning: Unexpected keys in state dict: {len(unexpected_keys)} keys")
+
+                # Check if critical components were loaded
+                critical_components = ['actor.0.weight', 'history_encoder.0.weight', 'wm_feature_encoder.0.weight']
+                loaded_critical = all(comp in new_state_dict for comp in critical_components)
+                if loaded_critical:
+                    print("Critical model components loaded successfully")
+                else:
+                    print("Warning: Some critical components may not be loaded properly")
+
+                self.model_loaded = True
+                print("Model loaded successfully!")
+                print(f"Training iteration: {checkpoint.get('iter', 'Unknown')}")
+
+                # Store checkpoint for std parameter access
+                self.checkpoint = checkpoint
+                self._init_world_model_from_checkpoint(checkpoint)
+
+            except Exception as e:
+                print(f"Error loading model: {e}")
+                print("Using placeholder implementation")
+                self.model_loaded = False
+        else:
+            print("No valid model path provided - using placeholder implementation")
+            self.model_loaded = False
+            # Fallback dims
+            self.history_dim = (48 if self.remove_dof_vel else 66) * 5 if cpg_reward else (42 if self.remove_dof_vel else 60) * 5
+            self.wm_feature_dim = 512
+            self.actor_critic = ActorCriticRWM(
+                num_actor_obs=self.obs_dim,
+                num_critic_obs=246,
+                num_actions=self.num_actions,
+                encoder_hidden_dims=[256, 128],
+                wm_encoder_hidden_dims=[64, 64],
+                actor_hidden_dims=[256, 128, 64],
+                critic_hidden_dims=[512, 256, 128],
+                activation='elu',
+                init_noise_std=1.0,
+                latent_dim=35,
+                wm_latent_dim=32,
+                cpg_reward_enabled=cpg_reward,
+                history_dim=self.history_dim,
+                wm_feature_dim=self.wm_feature_dim
+            ).to(device)
+
+        # Set model to evaluation mode
+        if self.model_loaded:
+            self.actor_critic.eval()
+
+        # Initialize basic state
+        self.step_count = 0
+        self.wm_is_first = torch.ones(1, device=self.device)
+
+        # World model runtime state (only set defaults if WM not loaded)
+        if getattr(self, "world_model", None) is None:
+            self.world_model = None
+            self.wm_latent = None
+            self.wm_feature = torch.zeros((1, 512), device=self.device)
+            self.wm_update_interval = 5
+            self.wm_action_history = torch.zeros((1, self.wm_update_interval, 18), device=self.device)
+            self.wm_action = None
+
+    def _init_world_model_from_checkpoint(self, checkpoint):
+        """Load WorldModelRWM weights and infer action history length."""
+        try:
+            from world_model.models import WorldModelRWM
+            import yaml
+            import pathlib
+            import argparse
+
+            wm_sd = checkpoint.get("world_model_dict", None)
+            if wm_sd is None:
+                print("Warning: checkpoint has no world_model_dict; wm_feature will stay zeros.")
+                return
+
+            # Infer prop_dim from encoder MLP weight (trained input dim)
+            prop_dim = int(wm_sd["encoder._mlp.layers.Encoder_linear0.weight"].shape[1])
+
+            # Infer wm action history dim from RSSM img_in weight
+            # inp_dim = stoch*discrete + num_actions
+            img_in_inp_dim = int(wm_sd["dynamics._img_in_layers.0.weight"].shape[1])
+            stoch = 32
+            discrete = 32
+            num_actions = img_in_inp_dim - (stoch * discrete)
+            update_interval = (num_actions // 18) if (num_actions % 18 == 0) else 5
+            if num_actions % 18 != 0:
+                print(
+                    f"Warning: inferred wm num_actions={num_actions} not multiple of 18; "
+                    "defaulting update_interval=5"
+                )
+
+            # Load default config and override key fields
+            cfg_path = pathlib.Path(__file__).parent / "world_model" / "configs.yaml"
+            configs = yaml.safe_load(cfg_path.read_text())
+            defaults = dict(configs.get("defaults", {}))
+            defaults["device"] = str(self.device)
+            defaults["num_actions"] = int(num_actions)
+            # Real robot has no camera; keep model but disable camera usage at runtime.
+            # Avoid pri_obs decoding to keep shapes simple.
+            defaults["decode_pri_obs"] = False
+            # Ensure encoder/decoder MLPs are built on CPU when CUDA is unavailable.
+            defaults["encoder"] = dict(defaults.get("encoder", {}))
+            defaults["decoder"] = dict(defaults.get("decoder", {}))
+            defaults["encoder"]["device"] = str(self.device)
+            defaults["decoder"]["device"] = str(self.device)
+            # Some YAML scalars like 1e-4 may be parsed as strings; cast for optimizer init
+            for k in ("model_lr", "opt_eps", "grad_clip", "weight_decay"):
+                if k in defaults and isinstance(defaults[k], str):
+                    try:
+                        defaults[k] = float(defaults[k])
+                    except Exception:
+                        pass
+
+            wm_config = argparse.Namespace(**defaults)
+            obs_shape = {"prop": (prop_dim,), "image": (64, 64, 1)}
+
+            wm = WorldModelRWM(
+                wm_config,
+                obs_shape,
+                use_camera=False,
+                device=torch.device(self.device) if isinstance(self.device, str) else self.device,
+            ).to(self.device)
+            wm.eval()
+
+            # Strip possible DDP prefix
+            wm_sd_stripped = {}
+            for k, v in wm_sd.items():
+                key = k[7:] if k.startswith("module.") else k
+                wm_sd_stripped[key] = v
+
+            missing, unexpected = wm.load_state_dict(wm_sd_stripped, strict=False)
+            if missing:
+                print(f"World model loaded with missing keys: {len(missing)} (strict=False)")
+            if unexpected:
+                print(f"World model loaded with unexpected keys: {len(unexpected)} (strict=False)")
+
+            self.world_model = wm
+            self.wm_update_interval = int(update_interval)
+            self.wm_action_history = torch.zeros((1, self.wm_update_interval, 18), device=self.device)
+            self.wm_action = None
+            self.wm_latent = None
+            self.wm_feature = torch.zeros((1, int(getattr(wm_config, "dyn_deter", 512))), device=self.device)
+
+            print(
+                f"World model initialized: prop_dim={prop_dim}, "
+                f"update_interval={self.wm_update_interval}, wm_feature_dim={self.wm_feature.shape[1]}"
+            )
+
+        except Exception as e:
+            print(f"Warning: failed to init world model from checkpoint: {e}")
+            self.world_model = None
+
+    def get_inference_policy(self):
+        """Get policy for inference"""
+        return self._policy_inference
+
+    def _policy_inference(self, obs, history, wm_feature):
+        """
+        Policy inference using loaded RWM model.
+
+        Args:
+            obs: Current observation tensor [batch_size, obs_dim]
+            history: Trajectory history tensor [batch_size, history_dim]
+            wm_feature: World model features [batch_size, feature_dim]
+
+        Returns:
+            actions: Action tensor [batch_size, action_dim]
+        """
+        if not self.model_loaded:
+            # Fallback to safe placeholder actions
+            batch_size = obs.shape[0]
+            action_dim = 18
+            return torch.randn(batch_size, action_dim, device=self.device) * 0.01
+
+        try:
+            # Use the full ActorCriticRWM model for inference
+            with torch.no_grad():
+                # Get deterministic actions by manually constructing the actor input
+                proprioceptive_obs = obs  # obs is already proprioceptive in our case
+
+                # Ensure inputs are batched
+                if proprioceptive_obs.dim() == 1:
+                    proprioceptive_obs = proprioceptive_obs.unsqueeze(0)
+                if history.dim() == 1:
+                    history = history.unsqueeze(0)
+                if wm_feature.dim() == 1:
+                    wm_feature = wm_feature.unsqueeze(0)
+
+                # Manually construct actor input like in act() method with proprioception_only=True
+                latent_vector = self.actor_critic.history_encoder(history)
+                command = proprioceptive_obs[:, 6:9]  # Extract commands from proprioceptive obs (positions 6:9)
+                wm_latent_vector = self.actor_critic.wm_feature_encoder(wm_feature)
+
+                # Concatenate: latent_vector + command + wm_latent_vector
+                concat_observations = torch.concat((latent_vector, command, wm_latent_vector), dim=-1)
+
+                # Get deterministic actions (mean of policy)
+                actions_mean = self.actor_critic.actor(concat_observations)
+
+                # Remove batch dimension if input was not batched
+                if obs.dim() == 1:
+                    actions_mean = actions_mean.squeeze(0)
+
+                return actions_mean
+
+        except Exception as e:
+            print(f"Policy inference error: {e}")
+            print("Falling back to safe actions")
+            batch_size = obs.shape[0] if obs.dim() > 1 else 1
+            return torch.zeros(batch_size, 18, device=self.device)
+
+    def update_world_model(self, obs_dict, prev_action=None):
+        """
+        Update world model state using loaded model.
+
+        Args:
+            obs_dict: Observation dictionary with 'prop', 'is_first', etc.
+            prev_action: previous action in radians, shape (18,) or tensor (1,18). Used to build 5-step action history.
+
+        Returns:
+            wm_feature: World model features
+        """
+        # If world model not available, keep zeros (better than random noise)
+        if self.world_model is None:
+            if 'is_first' in obs_dict:
+                obs_dict['is_first'][:] = 0
+            self.step_count += 1
+            return self.wm_feature
+
+        try:
+            with torch.no_grad():
+                # Update action history with prev_action (like playMBRL, wm_action is history of last K actions)
+                if prev_action is None:
+                    prev_action_t = torch.zeros((1, 18), device=self.device, dtype=torch.float32)
+                elif isinstance(prev_action, torch.Tensor):
+                    prev_action_t = prev_action.to(self.device).to(torch.float32)
+                    if prev_action_t.dim() == 1:
+                        prev_action_t = prev_action_t.unsqueeze(0)
+                else:
+                    prev_action_t = torch.tensor(prev_action, device=self.device, dtype=torch.float32).unsqueeze(0)
+
+                self.wm_action_history = torch.cat(
+                    (self.wm_action_history[:, 1:], prev_action_t.unsqueeze(1)), dim=1
+                )
+                self.wm_action = self.wm_action_history.flatten(1)  # (1, K*18)
+
+                # Update world model latent every K steps (matches training update_interval)
+                if self.step_count % self.wm_update_interval == 0:
+                    wm_obs = {
+                        'prop': obs_dict['prop'].to(self.device),
+                        'is_first': self.wm_is_first,
+                    }
+                    wm_embed = self.world_model.encoder(wm_obs)
+                    self.wm_latent, _ = self.world_model.dynamics.obs_step(
+                        self.wm_latent, self.wm_action, wm_embed, self.wm_is_first, sample=True
+                    )
+                    self.wm_feature = self.world_model.dynamics.get_deter_feat(self.wm_latent)
+                    self.wm_is_first[:] = 0
+
+        except Exception as e:
+            print(f"World model update error: {e}")
+            # keep last wm_feature
+
+        self.step_count += 1
+        return self.wm_feature
+
+    def reset(self):
+        """Reset inference state"""
+        self.step_count = 0
+        print("RWM inference state reset")
+
+
+def read_imu(q_imu):
+    """IMU reading process - Simplified like CPGs (no while loop, callback-driven)"""
+    # Re-import modules for subprocess
+    import lib.device_model as deviceModel
+    from lib.data_processor.roles.jy901s_dataProcessor import JY901SDataProcessor
+    from lib.protocol_resolver.roles.wit_protocol_resolver import WitProtocolResolver
+    
+    # Define callback function for subprocess
+    def onUpdate(deviceModel):
+        """IMU data update callback"""
+        try:
+            IMU_data = np.array([deviceModel.getDeviceData("angleX"),
+                                deviceModel.getDeviceData("angleY"),
+                                deviceModel.getDeviceData("angleZ"),
+                                deviceModel.getDeviceData("gyroX"),
+                                deviceModel.getDeviceData("gyroY"),
+                                deviceModel.getDeviceData("gyroZ"),
+                                deviceModel.getDeviceData("accX"),
+                                deviceModel.getDeviceData("accY"),
+                                deviceModel.getDeviceData("accZ")])
+            q_imu.put(IMU_data)
+        except Exception as e:
+            print(f"IMU onUpdate error: {e}")
+
+    try:
+        device = deviceModel.DeviceModel(
+            "JY901",
+            WitProtocolResolver(),
+            JY901SDataProcessor(),
+            "51_0"
+        )
+
+        if (platform.system().lower() == 'linux'):
+            device.serialConfig.portName = '/dev/ttyUSB0'#'/dev/serial/by-id/usb-1a86_USB2.0-Ser_-if00-port0'
+        else:
+            device.serialConfig.portName = "COM39"
+        device.serialConfig.baud = 230400
+        device.ADDR = 0x50
+        device.openDevice()
+
+        readConfig(device)
+        device.dataProcessor.onVarChanged.append(onUpdate)
+        
+        print("IMU process: Device opened successfully, callback registered")
+        # No while loop - rely on callback mechanism like CPGs
+        
+    except Exception as e:
+        print(f"IMU process error: {e}")
+
+
+def onUpdate(deviceModel):
+    """IMU data update callback"""
+    global IMU_data
+    IMU_data = np.array([deviceModel.getDeviceData("angleX"),
+                        deviceModel.getDeviceData("angleY"),
+                        deviceModel.getDeviceData("angleZ"),
+                        deviceModel.getDeviceData("gyroX"),
+                        deviceModel.getDeviceData("gyroY"),
+                        deviceModel.getDeviceData("gyroZ"),
+                        deviceModel.getDeviceData("accX"),
+                        deviceModel.getDeviceData("accY"),
+                        deviceModel.getDeviceData("accZ")])
+    q_imu_1.put(IMU_data)
+
+
+def create_observation_from_real_robot(servos, q_imu, step, history_length=5, cpg_reward=False, previous_actions=None):
+    """
+    Create observation from real robot sensors, matching the structure used in simulation.
+    Based on hexapodMBRL.compute_observations()
+    """
+    # Read servo positions and velocities (joints are in degrees, convert to simulation units)
+    position_Read = servos.read_all_positions()  # degrees
+    theta_rad = position_Read * math.pi / 180.0  # convert to radians
+
+    velocity_rads = np.zeros(18)
+    if not remove_dof_vel:
+        try:
+            velocity_Read = servos.read_all_velocity()
+            velocity_rads = velocity_Read * 0.229 * 2 * math.pi / 60.0
+        except Exception as e:
+            print(f"Warning: Failed to read joint velocities: {e}, using zeros")
+            velocity_rads = np.zeros(18)
+
+    # Read IMU data like CPGs: blocking get with timeout, then drain queue for latest
+    try:
+        IMU_data = q_imu.get(True, 10)  # Blocking get with 10s timeout (like CPGs)
+        while not q_imu.empty():
+            IMU_data = q_imu.get(True, 10)  # Get latest data
+    except:
+        # If no IMU data available, use zeros
+        print("Warning: No IMU data available, using zeros")
+        IMU_data = np.zeros(9)
+
+    # Handle IMU initialization (for drift correction)
+    if not hasattr(create_observation_from_real_robot, 'imu_init'):
+        create_observation_from_real_robot.imu_init = IMU_data[0:3].copy()
+        create_observation_from_real_robot.imu_init_time = time.time()
+        print(f"IMU initialized with angles: roll={create_observation_from_real_robot.imu_init[0]:.3f}, pitch={create_observation_from_real_robot.imu_init[1]:.3f}, yaw={create_observation_from_real_robot.imu_init[2]:.3f}")
+
+    # Method 1: Basic drift correction (subtract initial values)
+    IMU_data_corrected = IMU_data[0:3] - create_observation_from_real_robot.imu_init
+
+    # Method 2: Periodic re-initialization every 10 seconds to reduce drift
+    current_time = time.time()
+    if hasattr(create_observation_from_real_robot, 'imu_init_time'):
+        time_since_init = current_time - create_observation_from_real_robot.imu_init_time
+        if time_since_init > 10.0:  # Re-initialize every 10 seconds
+            print(f"Re-initializing IMU after {time_since_init:.1f} seconds to reduce drift")
+            create_observation_from_real_robot.imu_init = IMU_data[0:3].copy()
+            create_observation_from_real_robot.imu_init_time = current_time
+            IMU_data_corrected = np.zeros(3)  # Reset to zero after re-init
+        else:
+            IMU_data_corrected = IMU_data[0:3] - create_observation_from_real_robot.imu_init
+
+    IMU_data[0:3] = IMU_data_corrected
+
+    # Yaw offset: add pi/2 (90 deg) to match simulation initial yaw
+    IMU_data[2] = IMU_data[2] + 90.0
+
+    # Convert IMU angles to radians
+    roll, pitch, yaw = IMU_data[0:3] * math.pi / 180.0
+    # 将roll pitch yaw保存到observation_output.txt中
+
+    # Create observation vector matching simulation structure
+    # Based on hexapodMBRL.compute_observations()
+
+    # Base angular velocity (from IMU gyro, rad/s)
+    base_ang_vel = np.array([IMU_data[3], IMU_data[4], IMU_data[5]])  # gyro data
+
+    # Projected gravity (from IMU orientation)
+    # 与仿真一致：仿真中 gravity_vec = [0,0,-1]（世界系 z 向下），projected_gravity = quat_rotate_inverse(base_quat, gravity_vec)，
+    # 水平时 body 系中重力为 [0,0,-1]，即第三项为负。JY901 的 angleX/Y/Z 为 roll/pitch/yaw(度)，此处用欧拉 ZYX 推导
+    # 的 body 系重力方向，第三项取负以匹配仿真（水平时 ≈ [0, 0, -1]，若仿真用 9.81 量纲则再乘 9.81）。
+    projected_gravity = np.array([
+        -math.sin(pitch),  # x
+        math.sin(roll) * math.cos(pitch),  # y
+        -math.cos(roll) * math.cos(pitch)  # z: 取负以与仿真一致（仿真水平时为负）
+    ])
+    
+    # print("projected gravity: ", projected_gravity)
+
+    # Commands (fixed for real robot - can be modified for different behaviors)
+    commands = np.array([0.0, 0.050, 1.57])  # [lin_vel_x, lin_vel_y, ang_vel_yaw]
+
+    # Joint positions (convert servo angles to simulation joint angles matching action ranges)
+    # Map servo angles to simulation joint angles that match the action space
+    sim_joint_angles_rad = servo_angles_to_sim_angles(position_Read)
+
+    # Joint positions relative to default pose (neutral pose is zeros in simulation)
+    default_dof_pos = np.zeros(18)  # Neutral pose in simulation space
+    dof_pos_scaled = (sim_joint_angles_rad - default_dof_pos) * 1.0  # obs_scales.dof_pos = 1.0
+
+    # Joint velocities (map servo velocities to simulation joint velocities)
+    # The velocity direction needs to match the joint angle mapping
+    # If servo_angle = f(sim_angle), then servo_vel = f'(sim_angle) * sim_vel
+    # From the mappings:
+    # Hip joints: servo = 180 - sim => sim_vel = -servo_vel
+    # Left knee:  servo = 180 - sim => sim_vel = -servo_vel
+    # Right knee: servo = 180 - sim => sim_vel = -servo_vel
+    # Left ankle:  servo = 60 + sim => sim_vel = +servo_vel
+    # Right ankle: servo = 60 - sim => sim_vel = -servo_vel
+
+    # Reorder velocities to match simulation joint order and apply direction corrections
+    sim_joint_velocities = np.zeros(18)
+
+    # l1 leg (servo 0-2 -> sim 0-2)
+    sim_joint_velocities[0] = -velocity_rads[0]  # Hip: negative
+    sim_joint_velocities[1] = -velocity_rads[1]  # Left knee: negative
+    sim_joint_velocities[2] = velocity_rads[2]   # Left ankle: positive
+
+    # l2 leg (servo 6-8 -> sim 3-5)
+    sim_joint_velocities[3] = -velocity_rads[6]  # Hip: negative
+    sim_joint_velocities[4] = -velocity_rads[7]  # Left knee: negative
+    sim_joint_velocities[5] = velocity_rads[8]   # Left ankle: positive
+
+    # l3 leg (servo 12-14 -> sim 6-8)
+    sim_joint_velocities[6] = -velocity_rads[12] # Hip: negative
+    sim_joint_velocities[7] = -velocity_rads[13] # Left knee: negative
+    sim_joint_velocities[8] = velocity_rads[14]  # Left ankle: positive
+
+    # r1 leg (servo 3-5 -> sim 9-11)
+    sim_joint_velocities[9] = -velocity_rads[3]    # Hip: servo=180-sim → sim_vel=-servo_vel
+    sim_joint_velocities[10] = -velocity_rads[4]   # Right knee: servo=180-sim → sim_vel=-servo_vel
+    sim_joint_velocities[11] = -velocity_rads[5]   # Right ankle: servo=60-sim → sim_vel=-servo_vel
+
+    # r2 leg (servo 9-11 -> sim 12-14)
+    sim_joint_velocities[12] = -velocity_rads[9]   # Hip
+    sim_joint_velocities[13] = -velocity_rads[10]  # Right knee
+    sim_joint_velocities[14] = -velocity_rads[11]  # Right ankle
+
+    # r3 leg (servo 15-17 -> sim 15-17)
+    sim_joint_velocities[15] = -velocity_rads[15]  # Hip
+    sim_joint_velocities[16] = -velocity_rads[16]  # Right knee
+    sim_joint_velocities[17] = -velocity_rads[17]  # Right ankle
+
+    dof_vel_scaled = sim_joint_velocities * 0.05  # obs_scales.dof_vel = 1.0, but scaled down
+
+    # Actions (current actions, placeholder for now)
+    obs_action = np.zeros(18)
+
+    # Create proprioceptive features for RWM world model (order matches hexapodMBRL.compute_observations)
+    # Order: base_ang_vel, projected_gravity, commands, dof_pos [, dof_vel], [phase_bool], obs_action
+    if remove_dof_vel:
+        proprioceptive_obs = np.concatenate([base_ang_vel*0.05, projected_gravity, commands, dof_pos_scaled])
+    else:
+        proprioceptive_obs = np.concatenate([base_ang_vel*0.05, projected_gravity, commands, dof_pos_scaled, dof_vel_scaled])
+
+    prev_actions = previous_actions if previous_actions is not None else np.zeros(18)
+
+    # Add phase_bool then previous_actions when cpg_reward (same order as hexapodMBRL: phase_bool before obs_action)
+    if cpg_reward:
+        # Load phase bool data (similar to simulation)
+        if not hasattr(create_observation_from_real_robot, 'phase_bool'):
+            # Load phase bool data from CSV file
+            import csv
+            phase_bool_file = './world_model/contact_data.csv'#'./world_model/joint_angles_tetrapod_phase_bool_normal.csv'
+            try:
+                with open(phase_bool_file, 'r') as f:
+                    reader = csv.reader(f)
+                    phase_bool_data = []
+                    for row in reader:
+                        phase_bool_data.append([float(x) for x in row])
+                    create_observation_from_real_robot.phase_bool = np.array(phase_bool_data)
+                    print(f"Loaded phase_bool data with shape: {create_observation_from_real_robot.phase_bool.shape}")
+            except Exception as e:
+                print(f"Warning: Failed to load phase_bool data: {e}, using zeros")
+                create_observation_from_real_robot.phase_bool = np.zeros((100, 6))
+
+        # Get current phase bool based on step (cycle through the data)
+        cpg_idx = step % create_observation_from_real_robot.phase_bool.shape[0]
+        phase_bool_current = create_observation_from_real_robot.phase_bool[cpg_idx]
+
+        # Concatenate phase_bool_current first, then previous_actions (matching compute_observations)
+        proprioceptive_obs = np.concatenate([proprioceptive_obs, phase_bool_current])#, prev_actions])  # 51 dims
+    else:
+        proprioceptive_obs = np.concatenate([proprioceptive_obs])#, prev_actions])
+
+    # Create obs_without_command for history building (matching training logic)
+    # Order must match hexapodMBRL.compute_observations(): ... dof_pos [, dof_vel], phase_bool, obs_action
+    prev_actions = previous_actions if previous_actions is not None else np.zeros(18)
+    if remove_dof_vel:
+        base_part = np.concatenate([base_ang_vel*0.05, projected_gravity, dof_pos_scaled])
+    else:
+        base_part = np.concatenate([base_ang_vel*0.05, projected_gravity, dof_pos_scaled, dof_vel_scaled])
+    if cpg_reward:
+        obs_without_command = np.concatenate([base_part, phase_bool_current, prev_actions])  # ... phase_bool then previous_actions
+    else:
+        obs_without_command = np.concatenate([base_part, prev_actions])
+
+    # For policy observation, use full proprioceptive_obs (includes commands)
+    policy_obs = proprioceptive_obs.copy()
+
+    return policy_obs.astype(np.float32), obs_without_command.astype(np.float32), position_Read, IMU_data
+
+
+def run_imu_test_only():
+    """
+    仅测试 IMU 轴范围：关节不运动，只读 IMU。
+    机器人会先回到 neutral 姿态，之后不再下发关节指令；你手动移动机器人即可观察
+    IMU_data_corrected（roll/pitch/yaw 校正后）与 projected_gravity 的读数变化。
+    用于确认 IMU 各轴方向与量纲。
+    """
+    print("\n" + "=" * 60)
+    print("📐 IMU 轴范围测试模式：关节不动，请手动移动机器人观察读数")
+    print("=" * 60 + "\n")
+
+    # Step 1–4: Servos（与主流程一致）
+    print("📍 Step 1: Initializing Servos...")
+    try:
+        servos = Servos()
+        print("   ✓ Servos object created")
+    except Exception as e:
+        print(f"   ❌ Failed to create Servos: {e}")
+        raise
+
+    print("\n📍 Step 2: Reading voltage...")
+    try:
+        voltage = servos.read_voltage(1)
+        print(f"   ✓ Voltage: {voltage}V")
+        if voltage < ROBOT_CONFIG['control']['voltage_threshold']:
+            print(f"   ⚠️  WARNING: Voltage too low!")
+    except Exception as e:
+        print(f"   ❌ Failed to read voltage: {e}")
+        raise
+
+    print("\n📍 Step 3: Setting position control mode...")
+    try:
+        servos.set_position_control()
+        print("   ✓ Position control mode set")
+    except Exception as e:
+        print(f"   ❌ Failed to set position control: {e}")
+        raise
+
+    position_all = range(18)
+    print("\n📍 Step 4: Enabling torque...")
+    try:
+        servos.enable_torque(position_all)
+        print("   ✓ Torque enabled for all servos")
+    except Exception as e:
+        print(f"   ❌ Failed to enable torque: {e}")
+        raise
+
+    # Step 5: IMU
+    print("\n📍 Step 5: Initializing IMU process...")
+    q_imu = Queue()
+    imu_process = Process(target=read_imu, args=(q_imu,))
+    imu_process.daemon = True
+    imu_process.start()
+    print("   ✓ IMU process started")
+
+    imu_ready = False
+    for i in range(20):
+        time.sleep(0.1)
+        if not q_imu.empty():
+            imu_ready = True
+            print("   ✓ IMU data detected")
+            break
+    if not imu_ready:
+        print("   ⚠️  Warning: No IMU data received. Check USB and permissions.")
+
+    # Step 6: 回到 neutral，之后不再写关节
+    print("\n📍 Step 6: Moving to neutral position (no further joint commands will be sent)...")
+    neutral_angles = ROBOT_CONFIG['neutral_angles']
+    real_angles = radians_to_degrees(neutral_angles * np.pi / 180.0)
+    ticks = angles_to_ticks(real_angles)
+    try:
+        servos.Robot_initialize(real_angles)
+        print("   ✓ Robot at neutral position")
+    except Exception as e:
+        print(f"   ❌ Failed to initialize robot position: {e}")
+        raise
+
+    # 可选：写 IMU 测试日志
+    output_dir = "validation_outputs"
+    os.makedirs(output_dir, exist_ok=True)
+    imu_test_file = os.path.join(output_dir, "imu_test_axes.txt")
+    f_log = open(imu_test_file, 'w')
+    f_log.write("step\troll_corrected\tpitch_corrected\tyaw_corrected\tproj_grav_x\tproj_grav_y\tproj_grav_z\n")
+
+    print("\n" + "=" * 60)
+    print("开始 IMU 读数循环：请手动改变机器人朝向，观察下方 IMU_data_corrected 与 projected_gravity。Ctrl+C 退出。")
+    print("  IMU_data_corrected = (roll, pitch, yaw) 单位度；projected_gravity 与仿真一致，水平时 z≈-1。")
+    print("=" * 60 + "\n")
+
+    step = 0
+    print_interval = 0.15
+    last_print = time.time()
+
+    try:
+        while step < MAX_STEPS:
+            start_time = time.time()
+            try:
+                real_obs, obs_without_command, position_Read, IMU_data = create_observation_from_real_robot(
+                    servos, q_imu, step, history_length=5, cpg_reward=cpg_reward, previous_actions=None
+                )
+            except Exception as e:
+                print(f"   ⚠️  Read sensors error: {e}")
+                time.sleep(0.2)
+                step += 1
+                continue
+
+            # IMU_data_corrected：校正后的 roll/pitch/yaw（yaw 未加 90 的版本）
+            roll_corr = float(IMU_data[0])
+            pitch_corr = float(IMU_data[1])
+            yaw_corr = float(IMU_data[2]) - 90.0  # 去掉观测里加的 90°
+
+            # projected_gravity 在 real_obs 中位于 [3:6]
+            proj_grav = real_obs[3:6]
+
+            now = time.time()
+            if now - last_print >= print_interval:
+                last_print = now
+                print("---")
+                print("  IMU_data_corrected (°)   roll    pitch   yaw(未+90)")
+                print("  values                  {:7.2f}  {:7.2f}  {:7.2f}".format(roll_corr, pitch_corr, yaw_corr))
+                print("  projected_gravity       x       y       z")
+                print("  values                  {:7.3f}  {:7.3f}  {:7.3f}".format(proj_grav[0], proj_grav[1], proj_grav[2]))
+                print("  (* 水平时 z 应为负，与仿真一致)")
+
+            f_log.write("{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.6f}\t{:.6f}\t{:.6f}\n".format(
+                step, roll_corr, pitch_corr, yaw_corr, proj_grav[0], proj_grav[1], proj_grav[2]))
+            f_log.flush()
+
+            elapsed = time.time() - start_time
+            while (time.time() - start_time) < TARGET_DT:
+                pass
+            step += 1
+
+    except KeyboardInterrupt:
+        print("\n已退出 IMU 测试")
+    finally:
+        f_log.close()
+        print("  IMU 测试日志已保存: {}".format(imu_test_file))
+        try:
+            imu_process.terminate()
+            imu_process.join(timeout=2.0)
+            if imu_process.is_alive():
+                imu_process.kill()
+        except Exception:
+            pass
+
+
+def run_replay_sim_dof(sim_data_path=None):
+    """
+    使用仿真观测文件 sim_data/wm_obs_prop.txt 中的 dof_pos 作为关节指令回放。
+    不跑策略，按步数依次取文件中的 dof_pos，转换为舵机角度后下发。
+    若步数超过文件行数则循环使用（step % 帧数）。
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if sim_data_path is None:
+        sim_data_path = os.path.join(current_dir, 'sim_data', 'wm_obs_prop.txt')
+    if not os.path.isfile(sim_data_path):
+        print(f"Error: Sim data file not found: {sim_data_path}")
+        return
+
+    print("\n" + "=" * 60)
+    print("Replay sim dof_pos: 使用仿真观测中的 dof_pos 作为关节指令")
+    print("=" * 60 + "\n")
+
+    dof_pos_list = load_sim_dof_pos(sim_data_path)
+    if not dof_pos_list:
+        print("Error: No valid dof_pos blocks in file.")
+        return
+    print(f"Loaded {len(dof_pos_list)} frames from {sim_data_path}")
+
+    # 与主流程一致的初始化
+    print("📍 Step 1: Initializing Servos...")
+    try:
+        servos = Servos()
+        print("   ✓ Servos object created")
+    except Exception as e:
+        print(f"   ❌ Failed to create Servos: {e}")
+        raise
+
+    print("\n📍 Step 2: Reading voltage...")
+    try:
+        voltage = servos.read_voltage(1)
+        print(f"   ✓ Voltage: {voltage}V")
+        if voltage < ROBOT_CONFIG['control']['voltage_threshold']:
+            print(f"   ⚠️  WARNING: Voltage too low!")
+    except Exception as e:
+        print(f"   ❌ Failed to read voltage: {e}")
+        raise
+
+    print("\n📍 Step 3: Setting position control mode...")
+    try:
+        servos.set_position_control()
+        print("   ✓ Position control mode set")
+    except Exception as e:
+        print(f"   ❌ Failed: {e}")
+        raise
+
+    position_all = range(18)
+    print("\n📍 Step 4: Enabling torque...")
+    try:
+        servos.enable_torque(position_all)
+        print("   ✓ Torque enabled")
+    except Exception as e:
+        print(f"   ❌ Failed: {e}")
+        raise
+
+    print("\n📍 Step 5: Initializing IMU process...")
+    q_imu = Queue()
+    imu_process = Process(target=read_imu, args=(q_imu,))
+    imu_process.daemon = True
+    imu_process.start()
+    print("   ✓ IMU process started")
+    imu_ready = False
+    for _ in range(20):
+        time.sleep(0.1)
+        if not q_imu.empty():
+            imu_ready = True
+            print("   ✓ IMU data detected")
+            break
+    if not imu_ready:
+        print("   ⚠️  Warning: No IMU data received, observations will use zeros for IMU.")
+
+    print("\n📍 Step 6: Moving to neutral position...")
+    neutral_angles = ROBOT_CONFIG['neutral_angles']
+    real_angles = radians_to_degrees(neutral_angles * np.pi / 180.0)
+    ticks = angles_to_ticks(real_angles)
+    try:
+        servos.Robot_initialize(real_angles)
+        print("   ✓ Robot at neutral")
+    except Exception as e:
+        print(f"   ❌ Failed: {e}")
+        raise
+
+    angle_limits = ROBOT_CONFIG['angle_limits']
+    output_dir = "validation_outputs"
+    os.makedirs(output_dir, exist_ok=True)
+    actions_file = os.path.join(output_dir, "actions_output.txt")
+    observations_file = os.path.join(output_dir, "observations_output.txt")
+    print(f"\nLogging to {actions_file} and {observations_file}")
+    print("开始按 sim dof_pos 回放，Ctrl+C 退出...")
+
+    step = 0
+    try:
+        with open(actions_file, 'w') as f_actions, open(observations_file, 'w') as f_obs:
+            f_actions.write("step\tactions_18\tangles_18\tticks_18\n")
+            f_obs.write("step\tbase_ang_vel_3\tprojected_gravity_3\tcommands_3\tdof_pos_18\tdof_vel_18\tobs_action_18\troll\tpitch\tyaw\n")
+
+            while step < MAX_STEPS:
+                start_time = time.time()
+                frame_idx = step % len(dof_pos_list)
+                dof_pos_rad = dof_pos_list[frame_idx].copy()
+
+                # 读实物观测（与主流程一致）
+                try:
+                    real_obs, obs_without_command, position_Read, IMU_data = create_observation_from_real_robot(
+                        servos, q_imu, step, history_length=5, cpg_reward=cpg_reward, previous_actions=None
+                    )
+                except Exception as e:
+                    print(f"  ⚠️  Read sensors error at step {step}: {e}")
+                    time.sleep(0.2)
+                    step += 1
+                    continue
+
+                obs_str = '\t'.join([f'{x:.6f}' for x in real_obs])
+                roll, pitch, yaw = IMU_data[0], IMU_data[1], IMU_data[2]
+                f_obs.write(f"{step}\t{obs_str}\t{roll:.6f}\t{pitch:.6f}\t{yaw:.6f}\n")
+                f_obs.flush()
+
+                # 本步下发的关节指令：sim dof_pos -> 舵机角度 -> ticks
+                servo_angles = sim_angles_rad_to_servo_angles_deg(dof_pos_rad)
+                for i in range(18):
+                    servo_angles[i] = np.clip(servo_angles[i], angle_limits['min'][i], angle_limits['max'][i])
+                ticks = angles_to_ticks(servo_angles)
+
+                actions_str = '\t'.join([f'{x:.6f}' for x in dof_pos_rad])
+                real_angles_str = '\t'.join([f'{x:.6f}' for x in servo_angles])
+                ticks_str = '\t'.join([f'{int(x)}' for x in ticks])
+                f_actions.write(f"{step}\t{actions_str}\t{real_angles_str}\t{ticks_str}\n")
+                f_actions.flush()
+
+                try:
+                    servos.write_all_positions(ticks)
+                except Exception as e:
+                    print(f"  ⚠️  Write error at step {step}: {e}")
+
+                while (time.time() - start_time) < TARGET_DT:
+                    pass
+                if step % 100 == 0:
+                    print(f"  Step {step} (frame {frame_idx}/{len(dof_pos_list)})")
+                step += 1
+    except KeyboardInterrupt:
+        print("\n已停止回放")
+    finally:
+        try:
+            imu_process.terminate()
+            imu_process.join(timeout=2.0)
+            if imu_process.is_alive():
+                imu_process.kill()
+        except Exception:
+            pass
+    print(f"Replay finished. Logs saved to {output_dir}/")
+
+
+def test_rwm_real_robot(model_path):
+    """Test RWM on real robot - simplified for deployment"""
+    
+    print("\n" + "="*60)
+    print("🚀 Starting Robot Control - Port Error Detection ENABLED")
+    print("="*60 + "\n")
+
+    # Initialize RWM inference
+    rwm_inference = RealRobotRWMInference(model_path, device='cpu', remove_dof_vel=remove_dof_vel)
+    policy = rwm_inference.get_inference_policy()
+
+
+    # Initialize real robot components
+    print("📍 Step 1: Initializing Servos...")
+    try:
+        servos = Servos()
+        print("   ✓ Servos object created")
+    except Exception as e:
+        print(f"   ❌ Failed to create Servos: {e}")
+        raise
+    
+    print("\n📍 Step 2: Reading voltage...")
+    try:
+        voltage = servos.read_voltage(1)
+        print(f"   ✓ Voltage: {voltage}V")
+        if voltage < ROBOT_CONFIG['control']['voltage_threshold']:
+            print(f"   ⚠️  WARNING: Voltage too low! Required: {ROBOT_CONFIG['control']['voltage_threshold']}V")
+    except Exception as e:
+        print(f"   ❌ Failed to read voltage: {e}")
+        raise
+
+    print("\n📍 Step 3: Setting position control mode...")
+    try:
+        servos.set_position_control()
+        print("   ✓ Position control mode set")
+    except Exception as e:
+        print(f"   ❌ Failed to set position control: {e}")
+        raise
+    
+    position_all = range(18)
+    print("\n📍 Step 4: Enabling torque...")
+    print("   Press any key to enable servos! (or press ESC to quit!)")
+    try:
+        servos.enable_torque(position_all)
+        print("   ✓ Torque enabled for all servos")
+    except Exception as e:
+        print(f"   ❌ Failed to enable torque: {e}")
+        raise
+
+    print("\n📍 Step 5: Initializing IMU process...")
+    # Initialize IMU
+    q_imu = Queue()
+    imu_process = Process(target=read_imu, args=(q_imu,))
+    imu_process.daemon = True  # Set as daemon so it dies with parent
+    imu_process.start()
+    print("   ✓ IMU process started")
+
+    # Wait for IMU to initialize, but don't block forever
+    imu_ready = False
+    for i in range(20):  # Wait up to 2 seconds
+        time.sleep(0.1)
+        if not q_imu.empty():
+            imu_ready = True
+            print("   ✓ IMU data detected")
+            break
+
+    if not imu_ready:
+        print("   ⚠️  Warning: No IMU data received, using simulation mode")
+        # Start a mock IMU process for testing
+        def mock_imu_process(q):
+            import time
+            import numpy as np
+            import signal
+            import sys
+            
+            def signal_handler(sig, frame):
+                sys.exit(0)
+            
+            signal.signal(signal.SIGTERM, signal_handler)
+            signal.signal(signal.SIGINT, signal_handler)
+            
+            try:
+                while True:
+                    # Generate mock IMU data
+                    mock_data = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.8, 0.0])  # Basic gravity
+                    q.put(mock_data)
+                    time.sleep(0.05)  # 20Hz
+            except KeyboardInterrupt:
+                pass
+
+        mock_process = Process(target=mock_imu_process, args=(q_imu,))
+        mock_process.daemon = True  # Set as daemon
+        mock_process.start()
+        print("   ✓ Mock IMU process started")
+        imu_process = mock_process  # Replace imu_process reference
+
+    print("\n📍 Step 6: Moving to neutral position...")
+    # Initialize robot to neutral position
+    neutral_angles = ROBOT_CONFIG['neutral_angles']
+    real_angles = radians_to_degrees(neutral_angles * np.pi / 180.0)
+    ticks = angles_to_ticks(real_angles)
+    try:
+        servos.Robot_initialize(real_angles)
+        print("   ✓ Robot moved to neutral position")
+    except Exception as e:
+        print(f"   ❌ Failed to initialize robot position: {e}")
+        raise
+    
+    # 保存initialize角度到文件
+    with open('./validation_outputs/initialize_angles_test_rwm_real_robot.txt', 'a') as f:
+        f.write(str(real_angles) + '\n')
+
+    # Initialize trajectory history for policy input
+    # Use obs_without_command dimension (matching playMBRL.py)
+    history_length = 5
+    obs_without_command_dim = (42 if remove_dof_vel else 60) + (6 if cpg_reward else 0)
+    history_dim = obs_without_command_dim * history_length
+    trajectory_history = deque(maxlen=history_length)
+
+    # Initialize with zeros
+    for _ in range(history_length):
+        trajectory_history.append(np.zeros(obs_without_command_dim))
+
+    # Get action limits to prevent servo angle clipping
+    action_limits = get_action_limits()
+    print("Action limits calculated to prevent servo angle clipping:")
+    print(f"  Min action limits (degrees): {np.degrees(action_limits['min'])}")
+    print(f"  Max action limits (degrees): {np.degrees(action_limits['max'])}")
+
+    # Admittance controller to smooth actions
+    admittance_filter = AdmittanceFilter(
+        m=0.5,#0.1
+        d=15.0,#10
+        k=80.0,#80
+        dt=TARGET_DT,
+        num_joints=18
+    )
+    # Track whether we need to initialize the admittance filter
+    admittance_needs_init = True
+
+    # Initialize previous actions
+    previous_actions = None
+
+    # Initialize output files for validation
+    output_dir = "validation_outputs"
+    os.makedirs(output_dir, exist_ok=True)
+
+    actions_file = os.path.join(output_dir, "actions_output.txt")
+    observations_file = os.path.join(output_dir, "observations_output.txt")
+    policy_input_file = os.path.join(output_dir, "policy_input.txt")
+
+    print(f"Actions will be logged to: {actions_file}")
+    print(f"Observations will be logged to: {observations_file}")
+    print(f"Policy inputs will be logged to: {policy_input_file}")
+
+    step = 0
+    max_steps = MAX_STEPS  # Longer test run for better evaluation
+
+    print("Starting real robot control loop (ACTIVE MODE - robot will move!)")
+    print("⚠️  WARNING: Robot control is ENABLED. Ensure robot is in safe position!")
+    print("Press Ctrl+C to stop if anything goes wrong.")
+    input("Press Enter to continue or Ctrl+C to abort...")
+
+    print("Waiting 3 seconds before starting control...")
+    time.sleep(3)
+    print("Starting control loop...")
+
+    try:
+        with open(actions_file, 'w') as f_actions, open(observations_file, 'w') as f_obs, open(policy_input_file, 'w') as f_pi:
+            # Set up keyboard interrupt handler for emergency stop
+            import signal
+            import sys
+
+            def signal_handler(sig, frame):
+                print('\n⚠️  EMERGENCY STOP: Keyboard interrupt detected!')
+                print('Stopping robot control...')
+                try:
+                    # Add small delay to ensure any pending operations complete
+                    time.sleep(0.2)
+                    servos.disable_torque(position_all)
+                    print('✓ Robot torque disabled')
+                except Exception as e:
+                    print(f'✗ Failed to disable torque: {e}')
+                try:
+                    # Terminate IMU process first to release port
+                    imu_process.terminate()
+                    imu_process.join(timeout=1.0)
+                    print('✓ IMU process terminated')
+                except:
+                    pass
+                try:
+                    # Close servo port
+                    servos.portHandler.closePort()
+                    print('✓ Servo port closed')
+                except:
+                    pass
+                sys.exit(0)
+
+            signal.signal(signal.SIGINT, signal_handler)
+            print('✓ Emergency stop handler installed (Ctrl+C to stop)')
+            # Write headers
+            f_actions.write("step\tactions_18\tangles_18\tticks_18\n")
+            f_obs.write("step\tbase_ang_vel_3\tprojected_gravity_3\tcommands_3\tdof_pos_18\tdof_vel_18\tobs_action_18\troll\tpitch\tyaw\n")
+            f_pi.write("step\tcommand\thistory\twm_feature\n")
+
+            print("Log files opened successfully")
+
+            while step < max_steps:
+                loop_start_pc = time.perf_counter()
+                start_time = time.time()
+                
+                # Checkpoint A: Before reading sensors
+                if ENABLE_CONTROL_PRINT and step % 10 == 0:
+                    print(f"\n📍 Step {step}: Starting control iteration")
+
+                try:
+                    # Checkpoint B: Reading sensors
+                    if ENABLE_CONTROL_PRINT and step % 10 == 0:
+                        print(f"   📡 Reading sensors from robot...")
+                    
+                    # Get observation from real robot sensors ONLY
+                    sensor_start_pc = time.perf_counter()
+                    real_obs, obs_without_command, position_Read, IMU_data = create_observation_from_real_robot(servos, q_imu, step, history_length, cpg_reward, previous_actions)
+                    sensor_end_pc = time.perf_counter()
+                    
+                    if ENABLE_CONTROL_PRINT and step % 10 == 0:
+                        print(f"   ✓ Sensors read successfully")
+                    
+                except Exception as e:
+                    print(f"\n❌ ERROR at Step {step} - Reading sensors: {e}")
+                    error_count = getattr(servos, 'error_count', 0) + 1
+                    servos.error_count = error_count
+                    
+                    if error_count > 10:
+                        print(f"⚠️  Too many consecutive errors ({error_count}), stopping...")
+                        break
+                    
+                    print(f"⚠️  Skipping this step... (error count: {error_count})")
+                    time.sleep(0.2)  # Longer delay to let port recover
+                    step += 1
+                    continue
+
+                # Log complete observations (policy observation vector)
+                obs_str = '\t'.join([f'{x:.6f}' for x in real_obs])
+                # 获取IMU的角度数据 (roll, pitch, yaw)
+                roll = IMU_data[0]   # angleX
+                pitch = IMU_data[1]  # angleY
+                yaw = IMU_data[2]    # angleZ
+                f_obs.write(f"{step}\t{obs_str}\t{roll:.6f}\t{pitch:.6f}\t{yaw:.6f}\n")
+                if (step % LOG_FLUSH_EVERY_N_STEPS) == 0:
+                    f_obs.flush()  # 降低 flush 频率，减少文件 I/O 抖动
+
+                # For policy input, we use the full observation (proprioceptive features are already included)
+                proprioceptive_obs = real_obs
+                # 保存observation到文件中
+                #with open('./validation_outputs/proprioceptive_obs_test_rwm_real_robot.txt', 'a') as f:
+                #    f.write(str(proprioceptive_obs) + '\n')
+                with open('./validation_outputs/real_obs_test_rwm_real_robot.txt', 'a') as f:
+                    f.write(str(real_obs) + '\n')
+
+                # Prepare observation dict for world model
+                obs_dict = {
+                    "prop": torch.tensor(proprioceptive_obs, dtype=torch.float32).unsqueeze(0).to('cpu'),
+                    "is_first": rwm_inference.wm_is_first,
+                }
+
+                # Update world model and get features
+                wm_start_pc = time.perf_counter()
+                wm_feature = rwm_inference.update_world_model(obs_dict, previous_actions)
+                wm_end_pc = time.perf_counter()
+
+                # Prepare history
+                policy_start_pc = time.perf_counter()
+                history_flat = np.concatenate(list(trajectory_history))
+                history_tensor = torch.tensor(history_flat, dtype=torch.float32).unsqueeze(0).to('cpu')
+
+                # Log policy-related inputs for visualization: command, history (pre-encoder), wm_feature
+                prop = obs_dict["prop"].detach().cpu().numpy()
+                command_np = prop[0, 6:9]  # command = prop[6:9]
+                hist_np = history_flat  # history before encoder
+                wm_np = wm_feature.detach().cpu().numpy().flatten()
+                command_str = '\t'.join([f'{x:.6f}' for x in command_np])
+                hist_str = '\t'.join([f'{x:.6f}' for x in hist_np])
+                wm_str = '\t'.join([f'{x:.6f}' for x in wm_np])
+                f_pi.write(f"{step}\t{command_str}\t{hist_str}\t{wm_str}\n")
+                if (step % LOG_FLUSH_EVERY_N_STEPS) == 0:
+                    f_pi.flush()
+
+                # Get action from policy
+                #print("obs_dict['prop']: ", obs_dict["prop"])
+                #print("history_tensor: ", history_tensor)
+                #print("wm_feature: ", wm_feature)
+                actions = policy(obs_dict["prop"], history_tensor, wm_feature)
+                #print("actions: ", actions)
+
+                # For obs_without_command (next step): use clip-only, before scale and before asymmetric mapping (align with sim)
+                action_raw_np = actions.detach().cpu().numpy().flatten()
+                action_for_obs = np.clip(action_raw_np, action_limits['min'], action_limits['max'])
+
+                # Apply per-dimension action scaling for safety
+                scale_t = torch.as_tensor(
+                    ACTION_SCALE_PER_DIM, dtype=actions.dtype, device=actions.device
+                )
+                if actions.dim() == 2:
+                    actions = actions * scale_t.unsqueeze(0)
+                else:
+                    actions = actions * scale_t
+
+                # Convert actions (for execution)
+                action_np = actions.detach().cpu().numpy().flatten()
+
+                # Optional: apply asymmetric ankle mapping (to match simulation training semantics)
+                if USE_ASYMMETRIC_ANKLE_MAPPING:
+                    action_np = apply_asymmetric_ankle_mapping_rad(
+                        action_np,
+                        lift_range_rad=ASYM_ANKLE_LIFT_RANGE_RAD,
+                        sink_range_rad=ASYM_ANKLE_SINK_RANGE_RAD,
+                    )
+
+                # Limit action before admittance filtering
+                action_limited = np.clip(action_np, action_limits['min'], action_limits['max'])
+
+                # Check if any actions were clipped
+                action_clipped = np.any(action_np != action_limited)
+                if action_clipped and ENABLE_ACTION_CLIP_PRINT:
+                    clipped_count = np.sum(action_np != action_limited)
+                    print(f"  ⚠️  {clipped_count} actions were clipped to stay within safe limits")
+                    # Log which actions were clipped (optional)
+                    for i in range(18):
+                        if action_np[i] != action_limited[i]:
+                            print(f"     Action {i}: {np.degrees(action_np[i]):.2f}° -> {np.degrees(action_limited[i]):.2f}°")
+
+                    # Extra debug: show raw ankle actions (before clipping)
+                    ankle_indices = [2, 5, 8, 11, 14, 17]
+                    clipped_ankles = [i for i in ankle_indices if action_np[i] != action_limited[i]]
+                    if clipped_ankles:
+                        raw_deg = {i: float(np.degrees(action_np[i])) for i in ankle_indices}
+                        lim_deg = {i: float(np.degrees(action_limited[i])) for i in ankle_indices}
+                        lim_min_deg = {i: float(np.degrees(action_limits['min'][i])) for i in ankle_indices}
+                        lim_max_deg = {i: float(np.degrees(action_limits['max'][i])) for i in ankle_indices}
+                        print("  🦶 Ankle raw actions (deg) and limits:")
+                        for i in ankle_indices:
+                            flag = "CLIPPED" if i in clipped_ankles else "ok"
+                            print(
+                                f"     action[{i}]: raw={raw_deg[i]:7.2f}° -> limited={lim_deg[i]:7.2f}° "
+                                f"(range [{lim_min_deg[i]:.2f}°, {lim_max_deg[i]:.2f}°]) [{flag}]"
+                            )
+
+                # Admittance filter for smooth joint commands (optional)
+                if USE_ADMITTANCE:
+                    if admittance_needs_init:
+                        # Initialize using current real joint angles to avoid sudden jump
+                        current_sim_angles = servo_angles_to_sim_angles(position_Read)
+                        init_action = np.clip(current_sim_angles, action_limits['min'], action_limits['max'])
+                        admittance_filter.reset(init_action)
+                        admittance_needs_init = False
+                    action_filtered = admittance_filter.update(action_limited)
+                    action_filtered = np.clip(action_filtered, action_limits['min'], action_limits['max'])
+                else:
+                    action_filtered = action_limited.copy()
+
+                real_angles = action_to_servo_angles(action_filtered)
+
+                # Apply strict angle limits based on real robot measurements
+                angle_limits = ROBOT_CONFIG['angle_limits']
+                angle_limits_applied = False
+
+                for i in range(18):
+                    if real_angles[i] < angle_limits['min'][i]:
+                        if ENABLE_JOINT_LIMIT_PRINT:
+                            print(f"  ⚠️  Joint {i}: angle {real_angles[i]:.2f}° below limit {angle_limits['min'][i]:.2f}°, clipping")
+                        real_angles[i] = angle_limits['min'][i]
+                        angle_limits_applied = True
+                    elif real_angles[i] > angle_limits['max'][i]:
+                        if ENABLE_JOINT_LIMIT_PRINT:
+                            print(f"  ⚠️  Joint {i}: angle {real_angles[i]:.2f}° above limit {angle_limits['max'][i]:.2f}°, clipping")
+                        real_angles[i] = angle_limits['max'][i]
+                        angle_limits_applied = True
+
+                if angle_limits_applied:
+                    if ENABLE_JOINT_LIMIT_PRINT:
+                        print("  ✓ Angle limits applied to prevent unsafe movement")
+
+                ticks = angles_to_ticks(real_angles)
+
+                # Simplified write like CPGs: single write, no interpolation
+                if ENABLE_CONTROL_PRINT and step % 10 == 0:
+                    print(f"   📝 Writing positions to servos...")
+                
+                policy_end_pc = time.perf_counter()
+                try:
+                    # Single write like CPGs for reliability
+                    servo_start_pc = time.perf_counter()
+                    servos.write_all_positions(ticks)
+                    servo_end_pc = time.perf_counter()
+                    
+                    if ENABLE_CONTROL_PRINT and step % 10 == 0:
+                        print(f"   ✓ Positions written successfully")
+                        
+                except Exception as e:
+                    print(f"\n❌ ERROR at Step {step} - Writing positions: {e}")
+                    raise  # Re-raise to stop immediately
+                # 将real_angles和ticks写入文件
+                with open('./validation_outputs/real_angles_test_rwm_real_robot.txt', 'a') as f:
+                    f.write(str(real_angles) + '\n')
+                with open('./validation_outputs/ticks_test_rwm_real_robot.txt', 'a') as f:
+                    f.write(str(ticks) + '\n')
+                
+                ## Log actions (BEFORE sending to servos) - using limited actions
+                #actions_str = '\t'.join([f'{x:.6f}' for x in action_limited])
+                # Log actions (BEFORE sending to servos) - using filtered actions
+                actions_str = '\t'.join([f'{x:.6f}' for x in action_filtered])
+                real_angles_str = '\t'.join([f'{x:.6f}' for x in real_angles])
+                ticks_str = '\t'.join([f'{int(x)}' for x in ticks])
+                f_actions.write(f"{step}\t{actions_str}\t{real_angles_str}\t{ticks_str}\n")
+                if (step % LOG_FLUSH_EVERY_N_STEPS) == 0:
+                    f_actions.flush()
+
+                # Final target already sent as the last interpolation point
+
+                # Print validation info (less verbose)
+                if ENABLE_CONTROL_PRINT and (step % 10 == 0 or step < 3):
+                    print(f"   📊 Step {step} completed:")
+                    print(f"      Actions: Range=[{action_np.min():.3f}, {action_np.max():.3f}], Mean={action_np.mean():.3f}")
+                    print(f"      Angles: Range=[{real_angles.min():.1f}, {real_angles.max():.1f}]°")
+                    print(f"      ✓ All safety checks passed")
+
+                # Check if angles exceed safe limits (detailed per joint)
+                angle_limits = ROBOT_CONFIG['angle_limits']
+                limit_violations = []
+
+                for i in range(18):
+                    if real_angles[i] < angle_limits['min'][i] or real_angles[i] > angle_limits['max'][i]:
+                        limit_violations.append(f"Joint {i}: {real_angles[i]:.1f}° (limit: {angle_limits['min'][i]:.1f}°-{angle_limits['max'][i]:.1f}°)")
+
+                if limit_violations:
+                    if ENABLE_JOINT_LIMIT_PRINT:
+                        print(f"  ❌ CRITICAL: {len(limit_violations)} joints exceed safe limits!")
+                        for violation in limit_violations[:3]:  # Show first 3 violations
+                            print(f"     {violation}")
+                    if len(limit_violations) > 3:
+                        if ENABLE_JOINT_LIMIT_PRINT:
+                            print(f"     ... and {len(limit_violations) - 3} more violations")
+                    if ENABLE_JOINT_LIMIT_PRINT:
+                        print("  ⏹️  EMERGENCY STOP: Unsafe angles detected, skipping servo command")
+                    # Skip servo command for this step - go to next iteration
+                    step += 1
+                    continue
+                else:
+                    if ENABLE_JOINT_LIMIT_PRINT:
+                        print(f"  ✓ All angles within safe limits")
+
+                # Additional safety check: ensure no extreme angle changes
+                if step > 0 and hasattr(create_observation_from_real_robot, 'last_angles'):
+                    angle_changes = np.abs(real_angles - create_observation_from_real_robot.last_angles)
+                    max_change = angle_changes.max()
+                    if max_change > 60.0:  # Max 30 degrees change per step
+                        if ENABLE_JOINT_LIMIT_PRINT:
+                            print(f"  ⚠️  WARNING: Large angle change detected: {max_change:.1f}°")
+                            print("  ⏹️  EMERGENCY STOP: Excessive movement, skipping servo command")
+                        step += 1
+                        continue
+
+                create_observation_from_real_robot.last_angles = real_angles.copy()
+
+                # Update trajectory history with obs_without_command (matching training format)
+                trajectory_history.append(obs_without_command.copy())
+
+                # Control timing like CPGs: busy-wait until target time
+                work_end_pc = time.perf_counter()
+                elapsed_time = time.time() - start_time
+                target_dt = TARGET_DT  # 20ms = 50Hz like CPGs
+                while (time.time() - start_time) < target_dt:
+                    pass  # Busy-wait like CPGs for precise timing
+                
+                final_elapsed = time.time() - start_time
+                if final_elapsed > target_dt * 1.5:
+                    if ENABLE_CONTROL_PRINT:
+                        print(f"Warning: Control loop took {final_elapsed*1000:.1f}ms (target {target_dt*1000:.1f}ms)")
+
+                # Update previous actions for next history input (sim-aligned: clip-only, scale前, 非对称映射前)
+                previous_actions = action_for_obs.copy()
+
+                if ENABLE_TIMING_REPORT and step > 0 and (step % TIMING_REPORT_EVERY_N_STEPS) == 0:
+                    sensor_ms = (sensor_end_pc - sensor_start_pc) * 1000.0
+                    wm_ms = (wm_end_pc - wm_start_pc) * 1000.0
+                    policy_ms = (policy_end_pc - policy_start_pc) * 1000.0
+                    servo_ms = (servo_end_pc - servo_start_pc) * 1000.0
+                    work_ms = (work_end_pc - loop_start_pc) * 1000.0
+                    total_ms = final_elapsed * 1000.0
+                    print(
+                        f"[Timing] step={step} sensor={sensor_ms:.1f}ms wm={wm_ms:.1f}ms "
+                        f"policy={policy_ms:.1f}ms servo={servo_ms:.1f}ms work={work_ms:.1f}ms total={total_ms:.1f}ms"
+                    )
+
+                step += 1
+
+                # 这里不再额外打印循环时间（交给 [Timing] 报告）
+
+        print("Control loop finished")
+        print(f"Output files saved in: {output_dir}/")
+        print("\nValidation Summary:")
+        print(f"  Total steps: {step}")
+        print(f"  Actions logged to: {actions_file}")
+        print(f"  Observations logged to: {observations_file}")
+        print("  Review the logged data to determine if action amplitudes need limiting.")
+
+    except Exception as e:
+        print(f"Error during validation: {e}")
+        print("Attempting to save partial results...")
+
+    finally:
+        # Disable port error detector during cleanup to avoid cascade errors
+        print("\n🔧 Starting cleanup process...")
+        if 'port_detector' in globals():
+            port_detector.disable()
+        
+        try:
+            print("  Terminating IMU process...")
+            imu_process.terminate()
+            imu_process.join(timeout=2.0)
+            if imu_process.is_alive():
+                print("  ⚠️  IMU process still alive, forcing kill...")
+                imu_process.kill()
+            print("  ✓ IMU process terminated")
+        except Exception as e:
+            print(f"  ⚠️  Warning: Could not terminate IMU process: {e}")
+        
+        # Small delay to ensure IMU port is released
+        time.sleep(0.3)
+        
+        try:
+            print("  Disabling servo torque...")
+            servos.disable_torque(position_all)
+            print("  ✓ Servos disabled")
+        except Exception as e:
+            print(f"  ⚠️  Warning: Could not disable servos: {e}")
+        
+        try:
+            print("  Closing servo port...")
+            servos.portHandler.closePort()
+            print("  ✓ Servo port closed")
+        except Exception as e:
+            print(f"  ⚠️  Warning: Could not close servo port: {e}")
+        
+        print("🔧 Cleanup completed")
+
+
+def verify_action_mapping():
+    """Verify the action to servo angle mapping logic"""
+    print("Verifying action to servo angle mapping...")
+
+    # Test with zero actions (should give neutral poses)
+    zero_actions = np.zeros(18)
+    servo_angles = action_to_servo_angles(zero_actions)
+    print(f"Zero actions -> Servo angles: {servo_angles}")
+
+    # Expected neutral angles based on mapping:
+    # Hip joints: 180° (action=0 -> 180°)
+    # Left knee: 270° (action=0 -> 270° - (0 + 90) = 180°, wait this seems wrong)
+    # Let me recalculate...
+
+    # Left knee: action=-90° -> 270°, so action=0 -> 270° - (0 + 90°) = 180°
+    # Right knee: action=0 -> 180°（同样以 180° 为默认零位）
+    # Left ankle: action=90° -> 150°, so action=0 -> 150° + (0 - 90°) = 60°
+    # Right ankle: action=-90° -> 150°, so action=0 -> 150° - (0 + 90°) = 60°
+
+    expected_neutral = np.array([
+        180, 180, 70,   # l1: hip=180, knee=180, ankle=60
+        180, 180, 70,   # r1: hip=180, knee=180, ankle=60
+        180, 180, 70,   # l2: hip=180, knee=180, ankle=60
+        180, 180, 70,   # r2: hip=180, knee=180, ankle=60
+        180, 180, 70,   # l3: hip=180, knee=180, ankle=60
+        180, 180, 70    # r3: hip=180, knee=180, ankle=60
+    ])
+
+    print(f"Expected neutral angles: {expected_neutral}")
+    print(f"Actual neutral angles: {servo_angles}")
+    print(f"Difference: {servo_angles - expected_neutral}")
+
+    # Test specific cases
+    print("\nTesting specific mapping cases:")
+
+    # Test hip joint: action=0 -> 180°, action=10° -> 170°, action=-10° -> 190°
+    test_actions = np.zeros(18)
+    test_actions[0] = math.radians(10)   # +10° action on l1 hip
+    test_actions[9] = math.radians(-10)  # -10° action on r1 hip
+    servo_angles = action_to_servo_angles(test_actions)
+    print(f"Hip test - l1 hip (idx 0): {servo_angles[0]:.1f}° (expected: 170.0°)")
+    print(f"Hip test - r1 hip (idx 3): {servo_angles[3]:.1f}° (expected: 190.0°)")
+
+    # Test knee joints
+    test_actions = np.zeros(18)
+    test_actions[1] = math.radians(-90)  # -90° action on l1 knee -> should give 270°
+    test_actions[10] = math.radians(-90)  # -90° action on r1 knee -> should give 270°
+    servo_angles = action_to_servo_angles(test_actions)
+    print(f"Knee test - l1 knee (idx 1): {servo_angles[1]:.1f}° (expected: 270.0°)")
+    print(f"Knee test - r1 knee (idx 4): {servo_angles[4]:.1f}° (expected: 270.0°)")
+
+    # Test ankle joints
+    test_actions = np.zeros(18)
+    test_actions[2] = math.radians(90)   # +90° action on l1 ankle -> should give 150°
+    test_actions[11] = math.radians(-90) # -90° action on r1 ankle -> should give 150°
+    servo_angles = action_to_servo_angles(test_actions)
+    print(f"Ankle test - l1 ankle (idx 2): {servo_angles[2]:.1f}° (expected: 150.0°)")
+    print(f"Ankle test - r1 ankle (idx 5): {servo_angles[5]:.1f}° (expected: 150.0°)")
+
+    print("Verification completed.")
+
+
+def verify_joint_mapping():
+    """Verify that joint angle and velocity mapping works correctly"""
+    print("\nVerifying joint angle and velocity mapping...")
+
+    # Test with neutral servo angles (around 180 degrees)
+    neutral_servo_angles = np.array([
+        180, 180, 60,   # l1: hip=180, knee=180, ankle=60
+        180, 180, 60,   # r1: hip=180, knee=180, ankle=60
+        180, 180, 60,   # l2: hip=180, knee=180, ankle=60
+        180, 180, 60,   # r2: hip=180, knee=180, ankle=60
+        180, 180, 60,   # l3: hip=180, knee=180, ankle=60
+        180, 180, 60    # r3: hip=180, knee=180, ankle=60
+    ])
+
+    sim_angles = servo_angles_to_sim_angles(neutral_servo_angles)
+    print("Neutral servo angles -> Simulation joint angles:")
+    print(f"  Servo angles: {neutral_servo_angles}")
+    print(f"  Sim angles (deg): {np.degrees(sim_angles)}")
+    print("  Expected: mostly zeros (neutral pose in simulation)")
+
+    # Test action->servo->sim round trip
+    test_actions = np.array([0.1, -0.2, 0.3, 0.05, -0.15, 0.25, -0.1, 0.2, -0.3,
+                            0.05, 0.15, -0.2, -0.08, 0.18, -0.12, 0.02, -0.25, 0.35])
+    test_actions_rad = test_actions
+
+    # Convert actions to servo angles
+    servo_angles = action_to_servo_angles(test_actions_rad)
+
+    # Convert servo angles back to sim angles
+    sim_angles_back = servo_angles_to_sim_angles(servo_angles)
+
+    print("\nRound trip test (actions -> servo -> sim):")
+    print(f"  Original actions (deg): {np.degrees(test_actions)}")
+    print(f"  Servo angles: {servo_angles}")
+    print(f"  Converted back (deg): {np.degrees(sim_angles_back)}")
+    print(f"  Difference: {np.degrees(test_actions - sim_angles_back)}")
+
+    print("Joint mapping verification completed.")
+
+
+def verify_action_limits():
+    """Verify that action limits prevent servo angle clipping"""
+    print("\nVerifying action limits...")
+
+    # Get action limits
+    action_limits = get_action_limits()
+
+    print("Action limits (degrees):")
+    for i in range(18):
+        min_deg = np.degrees(action_limits['min'][i])
+        max_deg = np.degrees(action_limits['max'][i])
+        print(f"  Action {i}: [{min_deg:.2f}, {max_deg:.2f}]°")
+
+    # Test boundary actions to ensure they don't cause servo clipping
+    print("\nTesting boundary actions...")
+
+    # Test minimum actions
+    min_actions = action_limits['min']
+    min_servo_angles = action_to_servo_angles(min_actions)  # Already in radians, function converts internally
+    print("Minimum actions -> Servo angles:")
+    for i in range(18):
+        servo_min = ROBOT_CONFIG['angle_limits']['min'][i]
+        servo_max = ROBOT_CONFIG['angle_limits']['max'][i]
+        servo_angle = min_servo_angles[i]
+        status = "✓" if servo_min <= servo_angle <= servo_max else "✗"
+        print(f"  Joint {i}: {servo_angle:.2f}° (limit: {servo_min:.2f}°-{servo_max:.2f}°) {status}")
+
+    # Test maximum actions
+    max_actions = action_limits['max']
+    max_servo_angles = action_to_servo_angles(max_actions)  # Already in radians, function converts internally
+    print("Maximum actions -> Servo angles:")
+    for i in range(18):
+        servo_min = ROBOT_CONFIG['angle_limits']['min'][i]
+        servo_max = ROBOT_CONFIG['angle_limits']['max'][i]
+        servo_angle = max_servo_angles[i]
+        status = "✓" if servo_min <= servo_angle <= servo_max else "✗"
+        print(f"  Joint {i}: {servo_angle:.2f}° (limit: {servo_min:.2f}°-{servo_max:.2f}°) {status}")
+
+    # Check if any servo angles are outside limits
+    min_violations = np.sum((min_servo_angles < ROBOT_CONFIG['angle_limits']['min']) |
+                           (min_servo_angles > ROBOT_CONFIG['angle_limits']['max']))
+    max_violations = np.sum((max_servo_angles < ROBOT_CONFIG['angle_limits']['min']) |
+                           (max_servo_angles > ROBOT_CONFIG['angle_limits']['max']))
+
+    if min_violations == 0 and max_violations == 0:
+        print("✓ All boundary actions stay within servo limits!")
+    else:
+        print(f"✗ {min_violations + max_violations} boundary violations detected!")
+
+    print("Action limits verification completed.")
+
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) > 1:
+        if sys.argv[1] == '--verify':
+            verify_action_mapping()
+        elif sys.argv[1] == '--verify-limits':
+            verify_action_limits()
+        elif sys.argv[1] == '--verify-mapping':
+            verify_joint_mapping()
+        elif sys.argv[1] == '--imu-test':
+            run_imu_test_only()
+        elif sys.argv[1] == '--replay-sim-dof':
+            sim_path = sys.argv[2] if len(sys.argv) > 2 else None
+            run_replay_sim_dof(sim_path)
+        else:
+            print("Usage: python test_rwm_real_robot.py [--verify|--verify-limits|--verify-mapping|--imu-test|--replay-sim-dof [sim_data_path]]")
+    else:
+        # Path to your trained RWM model checkpoint
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(current_dir, 'world_model', 'asyresume_model_6000.pt')
+        # model_path = os.path.join(current_dir, 'world_model', 'cpgtrack_model_5000.pt')
+        # model_path = os.path.join(current_dir, 'world_model', 'model-remove-vel-9_20000.pt')
+        # model_path = os.path.join(current_dir, 'world_model', 'model-cpg_10500.pt')
+        # model_path = os.path.join(current_dir, 'world_model', 'model_9500.pt')
+
+        print(f"Loading model from: {model_path}")
+        test_rwm_real_robot(model_path)
