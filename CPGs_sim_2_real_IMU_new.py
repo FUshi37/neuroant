@@ -32,6 +32,7 @@ import time
 import datetime
 import platform
 import struct
+import queue as _queue_std
 import lib.device_model as deviceModel
 from lib.data_processor.roles.jy901s_dataProcessor import JY901SDataProcessor
 from lib.protocol_resolver.roles.wit_protocol_resolver import WitProtocolResolver
@@ -199,65 +200,58 @@ def read_servos_only(servos,data_read,cpg_index,q_imu,socket_tcp,step):
 
 
 
-def onUpdate(deviceModel):
-    """
-    ���ݸ����¼�  Data update event
-    :param deviceModel: �豸ģ��    Device model
-    :return:
-    """
-    global IMU_data
-    '''
-    print("оƬʱ��:" + str(deviceModel.getDeviceData("Chiptime"))
-         , " �¶�:" + str(deviceModel.getDeviceData("temperature"))
-         , " ���ٶȣ�" + str(deviceModel.getDeviceData("accX")) +","+  str(deviceModel.getDeviceData("accY")) +","+ str(deviceModel.getDeviceData("accZ"))
-         ,  " ���ٶ�:" + str(deviceModel.getDeviceData("gyroX")) +","+ str(deviceModel.getDeviceData("gyroY")) +","+ str(deviceModel.getDeviceData("gyroZ"))
-         , " �Ƕ�:" + str(deviceModel.getDeviceData("angleX")) +","+ str(deviceModel.getDeviceData("angleY")) +","+ str(deviceModel.getDeviceData("angleZ"))
-        , " �ų�:" + str(deviceModel.getDeviceData("magX")) +","+ str(deviceModel.getDeviceData("magY"))+","+ str(deviceModel.getDeviceData("magZ"))
-        , " ����:" + str(deviceModel.getDeviceData("lon")) + " γ��:" + str(deviceModel.getDeviceData("lat"))
-        , " �����:" + str(deviceModel.getDeviceData("Yaw")) + " ����:" + str(deviceModel.getDeviceData("Speed"))
-         , " ��Ԫ��:" + str(deviceModel.getDeviceData("q1")) + "," + str(deviceModel.getDeviceData("q2")) + "," + str(deviceModel.getDeviceData("q3"))+ "," + str(deviceModel.getDeviceData("q4"))
-          )
-    '''
-    
-    IMU_data=np.array([deviceModel.getDeviceData("angleX"),deviceModel.getDeviceData("angleY"),deviceModel.getDeviceData("angleZ"),deviceModel.getDeviceData("gyroX"),
-                       deviceModel.getDeviceData("gyroY"),deviceModel.getDeviceData("gyroZ"),deviceModel.getDeviceData("accX"),deviceModel.getDeviceData("accY"),deviceModel.getDeviceData("accZ")])
-    #q_imu_1.append(q_imu)
-    q_imu_1.put(IMU_data)
-   
-
-
-    
-    global _IsWriteF
-    _IsWriteF = False             # ��ǲ���д���ʶ    Tag cannot write the identity
-    #_writeF.close()               #�ر��ļ� Close file
-     
-
-
 def read_imu(q_imu):
-     #init servos
-    global  q_imu_1
-    q_imu_1=q_imu
-    device = deviceModel.DeviceModel(
-        "�ҵ�JY901",
-        WitProtocolResolver(),
-        JY901SDataProcessor(),
-        "51_0"
-    )
+    """JY901 IMU reader (runs in a child process). Pushes 9-float rows to ``q_imu``.
 
-    if (platform.system().lower() == 'linux'):
-        device.serialConfig.portName = '/dev/serial/by-id/usb-1a86_USB2.0-Ser_-if00-port0'#"/dev/ttyUSB0"   #���ô���   Set serial port
-    else:
-        device.serialConfig.portName = "COM39"          #���ô���   Set serial port
-    device.serialConfig.baud = 230400                     #���ò�����  Set baud rate
-    device.ADDR=0x50
-    device.openDevice()                                 #�򿪴���   Open serial port
-    #setConfig()
-    
-    readConfig(device)                                  #��ȡ������Ϣ Read configuration information
-    
-    device.dataProcessor.onVarChanged.append(onUpdate)  #���ݸ����¼� Data update event
-    #q_imu.put(IMU_data)
-    
+    Uses callback ``onUpdate`` that calls ``q_imu.put`` directly (no global queue).
+
+    **Serial port (Linux):** set env ``IMU_SERIAL_PORT`` (e.g. ``/dev/ttyUSB0``).
+    Default is ``/dev/ttyUSB0`` to match ``test_rwm_real_robot.read_imu``.
+    The old hard-coded ``by-id`` path often does not exist on every machine, which
+    yields an empty queue and all-zero IMU in logs.
+    """
+    def onUpdate(dm):
+        try:
+            row = np.array(
+                [
+                    dm.getDeviceData("angleX"),
+                    dm.getDeviceData("angleY"),
+                    dm.getDeviceData("angleZ"),
+                    dm.getDeviceData("gyroX"),
+                    dm.getDeviceData("gyroY"),
+                    dm.getDeviceData("gyroZ"),
+                    dm.getDeviceData("accX"),
+                    dm.getDeviceData("accY"),
+                    dm.getDeviceData("accZ"),
+                ],
+                dtype=np.float64,
+            )
+            q_imu.put(row)
+        except Exception as e:
+            print(f"[read_imu] onUpdate error: {e}")
+
+    try:
+        device = deviceModel.DeviceModel(
+            "JY901",
+            WitProtocolResolver(),
+            JY901SDataProcessor(),
+            "51_0",
+        )
+        if platform.system().lower() == "linux":
+            port = os.environ.get("IMU_SERIAL_PORT", "/dev/ttyUSB0")
+        else:
+            port = os.environ.get("IMU_SERIAL_PORT", "COM39")
+        device.serialConfig.portName = port
+        device.serialConfig.baud = 230400
+        device.ADDR = 0x50
+        print(f"[read_imu] Opening IMU serial: {port}")
+        device.openDevice()
+        readConfig(device)
+        device.dataProcessor.onVarChanged.append(onUpdate)
+        print("[read_imu] IMU device opened, callback registered.")
+    except Exception as e:
+        print(f"[read_imu] FAILED to open IMU: {e}")
+        raise
 
               
 
@@ -565,6 +559,19 @@ def load_sysid_data(path):
     return result
 
 
+def _sysid_wait_imu_ready(q_imu, timeout_sec=15.0):
+    """Block until at least one non-trivial IMU sample arrives (or timeout)."""
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < timeout_sec:
+        try:
+            sample = q_imu.get(timeout=0.5)
+            if np.max(np.abs(sample)) > 1e-3:
+                return sample
+        except _queue_std.Empty:
+            continue
+    return None
+
+
 def collect_sysid_data(
     duration=30.0,
     dt=0.02,
@@ -609,6 +616,26 @@ def collect_sysid_data(
     imu_proc.daemon = True
     imu_proc.start()
     time.sleep(1.5)
+    imu_warm = _sysid_wait_imu_ready(q_imu, timeout_sec=15.0)
+    if imu_warm is None:
+        print(
+            "[SysID] ERROR: IMU queue empty after 15s. Check USB cable, "
+            "set IMU_SERIAL_PORT (e.g. export IMU_SERIAL_PORT=/dev/ttyUSB0), "
+            "and that no other process holds the IMU serial port."
+        )
+        try:
+            imu_proc.terminate()
+            imu_proc.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            servos.disable_torque(range(18))
+            servos.portHandler.closePort()
+        except Exception:
+            pass
+        raise RuntimeError("SysID: IMU did not produce data (all-zero risk).")
+
+    print(f"[SysID] IMU OK (warm sample max|.| = {np.max(np.abs(imu_warm)):.4f})")
 
     # --- Neutral pose from CPG first frame ---
     with open(tick_json, "r") as f:
@@ -666,6 +693,7 @@ def collect_sysid_data(
 
     n = 0
     imu_init = None
+    last_imu = np.asarray(imu_warm, dtype=np.float64).copy()
     print("[SysID] Starting collection...")
     t_origin = time.perf_counter()
 
@@ -708,14 +736,14 @@ def collect_sysid_data(
                     n = step + 1
                     break
 
-            # --- IMU ---
-            imu_data = np.zeros(9)
+            # --- IMU (keep last sample if queue momentarily empty) ---
             try:
-                imu_data = q_imu.get(timeout=0.05)
+                imu_data = q_imu.get(timeout=0.2)
                 while not q_imu.empty():
                     imu_data = q_imu.get_nowait()
-            except Exception:
-                pass
+                last_imu = np.asarray(imu_data, dtype=np.float64).copy()
+            except _queue_std.Empty:
+                imu_data = last_imu.copy()
             if step == 0:
                 imu_init = imu_data.copy()
             imu_buf[step] = imu_data
