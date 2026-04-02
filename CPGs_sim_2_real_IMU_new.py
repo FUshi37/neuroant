@@ -417,62 +417,92 @@ def reflex_(q_imu):
 
 import pickle as _sysid_pickle
 
-DXL_CURRENT_UNIT_MA = 2.69           # mA per raw unit (XM430)
-DXL_VELOCITY_UNIT_RPM = 0.229        # rev/min per raw unit (XM430)
+# XM430-W350 unit conversions
+DXL_CURRENT_UNIT_MA = 2.69           # mA per raw unit
+DXL_VELOCITY_UNIT_RPM = 0.229        # rev/min per raw unit
 DXL_POS_DEG_PER_TICK = 360.0 / 4096.0
+DXL_PWM_MAX_RAW = 885                # raw value = 100% duty cycle
+DXL_VOLTAGE_UNIT_V = 0.1             # V per raw unit (addr 144)
 
-SYSID_SAFE_POS_MIN_TICK = 200        # ~17.6 deg
-SYSID_SAFE_POS_MAX_TICK = 3900       # ~342.8 deg
+# XM430-W350 datasheet constants for Table 1 identification
+XM430_GEAR_RATIO = 353.5
+XM430_STALL_TORQUE_NM = 4.1          # at 12.0V / 2.3A
+XM430_KT_DATASHEET = 1.783           # Nm/A (stall_torque / stall_current)
+
+SYSID_SAFE_POS_MIN_TICK = 200
+SYSID_SAFE_POS_MAX_TICK = 3900
 SYSID_SAFE_CURRENT_ABS_RAW = 1200    # ~3228 mA
 
 
 def _sysid_s16(v):
-    """Unsigned 16-bit → signed."""
     return v - 65536 if v > 32767 else v
 
 
 def _sysid_s32(v):
-    """Unsigned 32-bit → signed."""
     return v - 4294967296 if v > 2147483647 else v
 
 
 def sysid_read_all_sensors(servos):
-    """Single SyncRead of addr 126..135 (current+velocity+position, 10 bytes).
+    """Single SyncRead of addr 124..145 (22 bytes per servo).
 
-    Returns:
-        pos_deg, vel_rpm, cur_mA  – converted np.float64 (18,)
-        pos_raw, vel_raw, cur_raw – signed integer np.int32 (18,)
+    XM430 control table layout in this range:
+        124-125  Present PWM          (2B, signed)  → V_pwm proxy
+        126-127  Present Current      (2B, signed)  → motor current I
+        128-131  Present Velocity     (4B, signed)  → joint velocity q̇
+        132-135  Present Position     (4B, unsigned) → joint position q
+        136-139  Velocity Trajectory  (4B, unsigned) → internal profile
+        140-143  Position Trajectory  (4B, unsigned) → internal profile
+        144-145  Present Input Voltage(2B, unsigned) → V_battery
+
+    These fields cover all real-robot observables needed for Table 1
+    parameter identification (eq. 1-4 & eq. 7 in the paper).
     """
-    gsr = GroupSyncRead(servos.portHandler, servos.packetHandler, 126, 10)
+    START_ADDR = 124
+    READ_LEN = 22
+    gsr = GroupSyncRead(servos.portHandler, servos.packetHandler,
+                        START_ADDR, READ_LEN)
     for i in servos.DXLn_ID:
         gsr.addParam(i)
 
-    pos_deg = np.zeros(18, dtype=np.float64)
-    vel_rpm = np.zeros(18, dtype=np.float64)
-    cur_mA  = np.zeros(18, dtype=np.float64)
-    pos_raw = np.zeros(18, dtype=np.int32)
-    vel_raw = np.zeros(18, dtype=np.int32)
-    cur_raw = np.zeros(18, dtype=np.int32)
+    N = 18
+    pos_deg   = np.zeros(N, dtype=np.float64)
+    vel_rpm   = np.zeros(N, dtype=np.float64)
+    cur_mA    = np.zeros(N, dtype=np.float64)
+    pos_raw   = np.zeros(N, dtype=np.int32)
+    vel_raw   = np.zeros(N, dtype=np.int32)
+    cur_raw   = np.zeros(N, dtype=np.int32)
+    pwm_raw   = np.zeros(N, dtype=np.int32)
+    voltage_V = np.zeros(N, dtype=np.float64)
 
     rc = gsr.txRxPacket()
     if rc != COMM_SUCCESS:
-        print(f"[SysID] SyncRead error: {servos.packetHandler.getTxRxResult(rc)}")
+        print(f"[SysID] SyncRead error: "
+              f"{servos.packetHandler.getTxRxResult(rc)}")
         gsr.clearParam()
-        return pos_deg, vel_rpm, cur_mA, pos_raw, vel_raw, cur_raw
+        return (pos_deg, vel_rpm, cur_mA,
+                pos_raw, vel_raw, cur_raw, pwm_raw, voltage_V)
 
     for i in servos.DXLn_ID:
-        if not gsr.isAvailable(i, 126, 10):
+        if not gsr.isAvailable(i, START_ADDR, READ_LEN):
             continue
-        c = _sysid_s16(gsr.getData(i, 126, 2))
-        v = _sysid_s32(gsr.getData(i, 128, 4))
-        p = gsr.getData(i, 132, 4)
-        cur_raw[i], vel_raw[i], pos_raw[i] = c, v, p
-        cur_mA[i]  = c * DXL_CURRENT_UNIT_MA
-        vel_rpm[i] = v * DXL_VELOCITY_UNIT_RPM
-        pos_deg[i] = p * DXL_POS_DEG_PER_TICK
+        pw = _sysid_s16(gsr.getData(i, 124, 2))
+        c  = _sysid_s16(gsr.getData(i, 126, 2))
+        v  = _sysid_s32(gsr.getData(i, 128, 4))
+        p  = gsr.getData(i, 132, 4)
+        vt = gsr.getData(i, 144, 2)
+
+        pwm_raw[i]   = pw
+        cur_raw[i]   = c
+        vel_raw[i]   = v
+        pos_raw[i]   = p
+        cur_mA[i]    = c * DXL_CURRENT_UNIT_MA
+        vel_rpm[i]   = v * DXL_VELOCITY_UNIT_RPM
+        pos_deg[i]   = p * DXL_POS_DEG_PER_TICK
+        voltage_V[i] = vt * DXL_VOLTAGE_UNIT_V
 
     gsr.clearParam()
-    return pos_deg, vel_rpm, cur_mA, pos_raw, vel_raw, cur_raw
+    return (pos_deg, vel_rpm, cur_mA,
+            pos_raw, vel_raw, cur_raw, pwm_raw, voltage_V)
 
 
 def sysid_read_pid_gains(servos):
@@ -540,6 +570,17 @@ def sysid_generate_trajectory(traj_type, neutral_deg, duration, dt, **kw):
         wave = sum(a * np.sin(2.0 * np.pi * f * ts) for f, a in zip(freqs, amps))
         for j in ji:
             traj[:, j] += wave
+
+    elif traj_type == "squat":
+        freq = kw.get("freq_hz", 0.5)
+        knee_amp = kw.get("amplitude_deg", 25.0)
+        wave = knee_amp * (1.0 - np.cos(2.0 * np.pi * freq * ts)) / 2.0
+        knee_ids = kw.get("knee_ids", [1, 4, 7, 10, 13, 16])
+        hip_ids = kw.get("hip_ids", [0, 3, 6, 9, 12, 15])
+        for j in knee_ids:
+            traj[:, j] += wave
+        for j in hip_ids:
+            traj[:, j] -= wave * 0.3
 
     else:
         raise ValueError(f"Unknown trajectory type: {traj_type}")
@@ -666,16 +707,18 @@ def collect_sysid_data(
           f"dt={dt}s  total={T * dt:.1f}s")
 
     # --- Pre-allocate buffers ---
-    timestamps   = np.zeros(T, dtype=np.float64)
-    q_deg_buf    = np.zeros((T, 18), dtype=np.float64)
-    q_raw_buf    = np.zeros((T, 18), dtype=np.int32)
-    qdot_rpm_buf = np.zeros((T, 18), dtype=np.float64)
-    qdot_raw_buf = np.zeros((T, 18), dtype=np.int32)
-    cur_mA_buf   = np.zeros((T, 18), dtype=np.float64)
-    cur_raw_buf  = np.zeros((T, 18), dtype=np.int32)
-    q_tgt_buf    = np.zeros((T, 18), dtype=np.float64)
-    imu_buf      = np.zeros((T, 9), dtype=np.float64)
-    loop_ms_buf  = np.zeros(T, dtype=np.float64)
+    timestamps    = np.zeros(T, dtype=np.float64)
+    q_deg_buf     = np.zeros((T, 18), dtype=np.float64)
+    q_raw_buf     = np.zeros((T, 18), dtype=np.int32)
+    qdot_rpm_buf  = np.zeros((T, 18), dtype=np.float64)
+    qdot_raw_buf  = np.zeros((T, 18), dtype=np.int32)
+    cur_mA_buf    = np.zeros((T, 18), dtype=np.float64)
+    cur_raw_buf   = np.zeros((T, 18), dtype=np.int32)
+    pwm_raw_buf   = np.zeros((T, 18), dtype=np.int32)
+    voltage_V_buf = np.zeros((T, 18), dtype=np.float64)
+    q_tgt_buf     = np.zeros((T, 18), dtype=np.float64)
+    imu_buf       = np.zeros((T, 9), dtype=np.float64)
+    loop_ms_buf   = np.zeros(T, dtype=np.float64)
 
     # --- SIGINT handler ---
     _stop = [False]
@@ -719,13 +762,15 @@ def collect_sysid_data(
             servos.write_all_positions(tgt_tick)
 
             # --- Read all sensors in one bus transaction ---
-            pd, vr, cm, pr, vrw, crw = sysid_read_all_sensors(servos)
-            q_deg_buf[step]    = pd
-            q_raw_buf[step]    = pr
-            qdot_rpm_buf[step] = vr
-            qdot_raw_buf[step] = vrw
-            cur_mA_buf[step]   = cm
-            cur_raw_buf[step]  = crw
+            pd, vr, cm, pr, vrw, crw, pw, vv = sysid_read_all_sensors(servos)
+            q_deg_buf[step]     = pd
+            q_raw_buf[step]     = pr
+            qdot_rpm_buf[step]  = vr
+            qdot_raw_buf[step]  = vrw
+            cur_mA_buf[step]    = cm
+            cur_raw_buf[step]   = crw
+            pwm_raw_buf[step]   = pw
+            voltage_V_buf[step] = vv
 
             # --- Current safety ---
             if safety_enabled:
@@ -753,9 +798,12 @@ def collect_sysid_data(
             loop_ms_buf[step] = elapsed * 1000.0
 
             if step % 50 == 0:
+                v_bat = np.mean(vv[vv > 0]) if np.any(vv > 0) else 0.0
                 print(f"  [{step:05d}/{T}] loop={elapsed*1000:.1f}ms  "
-                      f"|I|_max={np.max(np.abs(cm)):.0f}mA  "
-                      f"pos_err_max={np.max(np.abs(pd - tgt)):.2f}deg")
+                      f"|I|={np.max(np.abs(cm)):.0f}mA  "
+                      f"|PWM|={np.max(np.abs(pw))}  "
+                      f"V_bat={v_bat:.1f}V  "
+                      f"err={np.max(np.abs(pd - tgt)):.2f}deg")
 
             wait = dt - elapsed
             if wait > 0:
@@ -765,16 +813,18 @@ def collect_sysid_data(
         _sig.signal(_sig.SIGINT, old_handler)
 
         sl = slice(0, n)
-        timestamps   = timestamps[sl]
-        q_deg_buf    = q_deg_buf[sl]
-        q_raw_buf    = q_raw_buf[sl]
-        qdot_rpm_buf = qdot_rpm_buf[sl]
-        qdot_raw_buf = qdot_raw_buf[sl]
-        cur_mA_buf   = cur_mA_buf[sl]
-        cur_raw_buf  = cur_raw_buf[sl]
-        q_tgt_buf    = q_tgt_buf[sl]
-        imu_buf      = imu_buf[sl]
-        loop_ms_buf  = loop_ms_buf[sl]
+        timestamps    = timestamps[sl]
+        q_deg_buf     = q_deg_buf[sl]
+        q_raw_buf     = q_raw_buf[sl]
+        qdot_rpm_buf  = qdot_rpm_buf[sl]
+        qdot_raw_buf  = qdot_raw_buf[sl]
+        cur_mA_buf    = cur_mA_buf[sl]
+        cur_raw_buf   = cur_raw_buf[sl]
+        pwm_raw_buf   = pwm_raw_buf[sl]
+        voltage_V_buf = voltage_V_buf[sl]
+        q_tgt_buf     = q_tgt_buf[sl]
+        imu_buf       = imu_buf[sl]
+        loop_ms_buf   = loop_ms_buf[sl]
 
         meta = {
             "trajectory_type": trajectory_type,
@@ -788,21 +838,40 @@ def collect_sysid_data(
             "freq_start": freq_start,
             "freq_end": freq_end,
             "joint_indices": ji,
-            "voltage_raw": float(voltage) if voltage else 0.0,
+            "voltage_initial_raw": float(voltage) if voltage else 0.0,
             "pid_gains_DIP": pid_gains.tolist(),
             "neutral_target_deg": neutral_deg.tolist(),
             "neutral_readback_deg": neutral_read.tolist(),
             "imu_init": imu_init.tolist() if imu_init is not None else [],
             "safety_enabled": safety_enabled,
             "num_joints": 18,
+            "servo_model": "XM430-W350",
+            "gear_ratio": XM430_GEAR_RATIO,
+            "Kt_datasheet_Nm_per_A": XM430_KT_DATASHEET,
+            "stall_torque_Nm": XM430_STALL_TORQUE_NM,
             "units": {
                 "current_mA_per_raw": DXL_CURRENT_UNIT_MA,
                 "velocity_RPM_per_raw": DXL_VELOCITY_UNIT_RPM,
                 "position_deg_per_tick": DXL_POS_DEG_PER_TICK,
+                "pwm_100pct_raw": DXL_PWM_MAX_RAW,
+                "voltage_V_per_raw": DXL_VOLTAGE_UNIT_V,
                 "timestamp": "seconds",
                 "imu_angles": "degrees",
                 "imu_gyro": "deg/s",
                 "imu_acc": "m/s^2",
+            },
+            "table1_data_mapping": {
+                "Kt":       "Identify from current_mA, qdot_rpm, pwm_raw, voltage_V via eq(1)",
+                "Rter":     "Identify from pwm_raw → V_pwm = (pwm/885)*V_bat, current, back-EMF via eq(1)",
+                "armature": "Identify from q̈ (diff of qdot_rpm) vs torque (from current) via dynamics",
+                "eta_fw":   "Identify from motor torque vs load torque in forward-drive regimes via eq(3)",
+                "eta_bw":   "Identify from motor torque vs load torque in backward-drive regimes via eq(3)",
+                "fc":       "Identify from current/torque at constant velocity (Stribeck eq(4))",
+                "fs":       "Identify from current/torque at near-zero velocity transitions (eq(4))",
+                "kv":       "Identify from slope of torque vs velocity (eq(4))",
+                "base_mass_offset": "Identify from imu orientation dynamics",
+                "base_com_x":      "Identify from imu orientation dynamics",
+                "base_com_z":      "Identify from imu orientation dynamics",
             },
             "collection_time": datetime.datetime.now().isoformat(),
             "extra": metadata_extra or {},
@@ -820,6 +889,8 @@ def collect_sysid_data(
                 qdot_raw=qdot_raw_buf,
                 current_mA=cur_mA_buf,
                 current_raw=cur_raw_buf,
+                pwm_raw=pwm_raw_buf,
+                voltage_V=voltage_V_buf,
                 q_target_deg=q_tgt_buf,
                 imu=imu_buf,
                 loop_dt_ms=loop_ms_buf,
@@ -837,6 +908,8 @@ def collect_sysid_data(
                     "qdot_raw": qdot_raw_buf,
                     "current_mA": cur_mA_buf,
                     "current_raw": cur_raw_buf,
+                    "pwm_raw": pwm_raw_buf,
+                    "voltage_V": voltage_V_buf,
                     "q_target_deg": q_tgt_buf,
                     "imu": imu_buf,
                     "loop_dt_ms": loop_ms_buf,
@@ -1165,7 +1238,7 @@ if __name__ == '__main__':
     parser.add_argument("--sysid-dt", type=float, default=0.02,
                         help="Timestep (default 20ms = 50Hz)")
     parser.add_argument("--sysid-trajectory", type=str, default="cpg",
-                        choices=["cpg", "sinusoidal", "chirp", "multi_sine"],
+                        choices=["cpg", "sinusoidal", "chirp", "multi_sine", "squat"],
                         help="Excitation trajectory type")
     parser.add_argument("--sysid-output", type=str, default="sysid_data",
                         help="Output file path (without extension)")
