@@ -1,6 +1,7 @@
 
 import argparse
 import json
+import re
 from sys import path
 path.append("../../")
 import math
@@ -588,6 +589,32 @@ def sysid_generate_trajectory(traj_type, neutral_deg, duration, dt, **kw):
     return traj
 
 
+def load_wm_obs_dof_pos_rad(filepath):
+    """从 wm_obs_prop 风格文本中读取每帧 dof_pos（仿真顺序，弧度，长度 18）。
+
+    与 ``test_rwm_real_robot.load_sim_dof_pos`` 布局一致：每行/块为
+    ``[[ ... ]]``，其中 ``[9:27]`` 为关节位置。
+    """
+    out = []
+    with open(filepath, "r") as f:
+        content = f.read()
+    blocks = re.split(r"\]\s*\]", content)
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        block = re.sub(r"^\s*\[\s*\[\s*", "", block)
+        if not block:
+            continue
+        nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", block)
+        nums = [float(x) for x in nums]
+        if len(nums) < 27:
+            continue
+        dof_pos = np.array(nums[9:27], dtype=np.float64)
+        out.append(dof_pos)
+    return out
+
+
 def load_sysid_data(path):
     """Load system identification data from .npz or .pkl file."""
     if path.endswith(".pkl"):
@@ -626,6 +653,8 @@ def collect_sysid_data(
     joint_indices="all",
     safety_enabled=True,
     metadata_extra=None,
+    wm_obs_path=None,
+    wm_obs_max_frames=None,
 ):
     """Execute excitation trajectory on the real robot and record sensor data.
 
@@ -639,6 +668,13 @@ def collect_sysid_data(
 
     Saves <output_path>.npz  (numpy compressed)
           <output_path>.pkl  (pickle with metadata dict)
+
+    If ``wm_obs_path`` is set (e.g. ``world_model/wm_obs_prop.txt``), joint
+    targets are taken from simulation ``dof_pos`` in that file (same path as
+    ``test_rwm_real_robot.load_sim_dof_pos``), converted with
+    ``sim_angles_to_real``; ``duration`` is ignored for trajectory length
+    unless you pass ``wm_obs_max_frames``. Use this to replay sim trajectories
+    on hardware and collect SysID-format ``.npz`` for parameter refinement.
     """
     import signal as _sig
 
@@ -678,11 +714,22 @@ def collect_sysid_data(
 
     print(f"[SysID] IMU OK (warm sample max|.| = {np.max(np.abs(imu_warm)):.4f})")
 
-    # --- Neutral pose from CPG first frame ---
-    with open(tick_json, "r") as f:
-        d = json.load(f)
-    gps = np.asarray(d["goal_pos_sim"])
-    neutral_deg = sim_angles_to_real(gps[0])
+    # --- Neutral pose: CPG JSON first frame, or wm_obs first dof_pos ---
+    dof_list_wm = None
+    if wm_obs_path:
+        dof_list_wm = load_wm_obs_dof_pos_rad(wm_obs_path)
+        if not dof_list_wm:
+            raise RuntimeError(
+                f"[SysID] No valid dof_pos blocks in wm_obs file: {wm_obs_path}"
+            )
+        neutral_deg = sim_angles_to_real(
+            np.asarray(dof_list_wm[0], dtype=np.float64).reshape(6, 3)
+        )
+    else:
+        with open(tick_json, "r") as f:
+            d = json.load(f)
+        gps = np.asarray(d["goal_pos_sim"])
+        neutral_deg = sim_angles_to_real(gps[0])
     servos.Robot_initialize(neutral_deg)
     time.sleep(1.0)
     neutral_read = servos.read_all_positions()
@@ -696,12 +743,23 @@ def collect_sysid_data(
         ji = [int(x) for x in str(joint_indices).split(",")]
 
     # --- Generate trajectory ---
-    traj = sysid_generate_trajectory(
-        trajectory_type, neutral_deg, duration, dt,
-        tick_json=tick_json, joint_indices=ji,
-        freq_hz=freq_hz, amplitude_deg=amplitude_deg,
-        freq_start=freq_start, freq_end=freq_end,
-    )
+    if wm_obs_path:
+        n_frames = len(dof_list_wm)
+        if wm_obs_max_frames is not None:
+            n_frames = min(n_frames, int(wm_obs_max_frames))
+        traj = np.zeros((n_frames, 18), dtype=np.float64)
+        for t in range(n_frames):
+            dof = np.asarray(dof_list_wm[t], dtype=np.float64).reshape(6, 3)
+            traj[t] = sim_angles_to_real(dof)
+        print(f"[SysID] wm_obs replay: file={wm_obs_path}  frames={n_frames}")
+        trajectory_type = "wm_obs"
+    else:
+        traj = sysid_generate_trajectory(
+            trajectory_type, neutral_deg, duration, dt,
+            tick_json=tick_json, joint_indices=ji,
+            freq_hz=freq_hz, amplitude_deg=amplitude_deg,
+            freq_start=freq_start, freq_end=freq_end,
+        )
     T = traj.shape[0]
     print(f"[SysID] Trajectory: type={trajectory_type}  steps={T}  "
           f"dt={dt}s  total={T * dt:.1f}s")
@@ -829,8 +887,10 @@ def collect_sysid_data(
         meta = {
             "trajectory_type": trajectory_type,
             "tick_json": tick_json,
-            "duration_planned_s": duration,
+            "duration_planned_s": (T * dt) if wm_obs_path else duration,
             "dt_s": dt,
+            "wm_obs_path": wm_obs_path or "",
+            "wm_obs_max_frames": wm_obs_max_frames,
             "actual_steps": n,
             "actual_duration_s": float(timestamps[-1]) if n > 0 else 0.0,
             "freq_hz": freq_hz,
@@ -936,6 +996,201 @@ def collect_sysid_data(
             print(f"[SysID] Done: {n} steps in {timestamps[-1]:.2f}s")
         else:
             print("[SysID] No data collected")
+
+
+def replay_sysid_data(
+    npz_path="sysid_data.npz",
+    source="target",
+    dt=None,
+    safety_enabled=True,
+    tick_json="pos_cpg_4_new_36_1.json",
+):
+    """Replay joint motion from a SysID .npz on the real robot.
+
+    Uses the same control path as collect_sysid_data (angles_to_tick + optional
+    safety clip + write_all_positions + same loop timing).
+
+    Args:
+        npz_path: Path to .npz saved by collect_sysid_data.
+        source: ``target`` — use ``q_target_deg`` if present, else fall back to
+                ``q_deg`` (older npz without commands);
+                ``measured`` — ``q_deg`` (recorded feedback positions).
+        dt: Control period in seconds; if None, uses metadata ``dt_s`` or
+            median(diff(timestamps)) from the file.
+        safety_enabled: Same tick/current checks as SysID collection.
+        tick_json: Used only if the npz has no metadata: neutral pose for
+            Robot_initialize before moving to the first replay frame.
+    """
+    import signal as _sig
+
+    if not os.path.isfile(npz_path):
+        raise FileNotFoundError(f"Replay: file not found: {npz_path}")
+
+    raw = np.load(npz_path, allow_pickle=True)
+    names = set(raw.files)
+    key = None
+    if source == "measured":
+        key = "q_deg" if "q_deg" in names else None
+    else:
+        # target: prefer recorded command; older npz only have q_deg
+        if "q_target_deg" in names:
+            key = "q_target_deg"
+        elif "q_deg" in names:
+            key = "q_deg"
+            print(
+                "[SysID Replay] Warning: no q_target_deg in file; "
+                "replaying q_deg (recorded feedback) instead."
+            )
+    if key is None:
+        raise KeyError(
+            f"Replay: need q_deg or q_target_deg in {npz_path}, have {sorted(names)}"
+        )
+
+    traj = np.asarray(raw[key], dtype=np.float64)
+    if traj.ndim != 2 or traj.shape[1] != 18:
+        raise ValueError(f"Replay: {key} shape {traj.shape}, expected (T, 18)")
+
+    ts_file = np.asarray(raw["timestamps"], dtype=np.float64) if "timestamps" in names else None
+    meta = {}
+    if "metadata" in names:
+        try:
+            meta = json.loads(str(raw["metadata"][0]))
+        except Exception:
+            meta = {}
+
+    if dt is not None:
+        dt_use = float(dt)
+    elif meta.get("dt_s") is not None:
+        dt_use = float(meta["dt_s"])
+    elif ts_file is not None and len(ts_file) > 1:
+        dt_use = float(np.median(np.diff(ts_file)))
+    else:
+        dt_use = 0.02
+        print(f"[SysID Replay] No dt in file; defaulting to {dt_use}s")
+
+    T = traj.shape[0]
+    if ts_file is not None and len(ts_file) != T:
+        print(f"[SysID Replay] Warning: timestamps length {len(ts_file)} != traj {T}, using traj length")
+
+    print(f"[SysID Replay] {npz_path}  source={source}  steps={T}  dt={dt_use:.4f}s  "
+          f"duration≈{T * dt_use:.1f}s  safety={safety_enabled}")
+
+    # --- Hardware (same as collect_sysid_data) ---
+    servos = Servos()
+    servos.read_voltage(1)
+    servos.set_position_control()
+    servos.enable_torque(range(18))
+
+    q_imu = Queue()
+    imu_proc = Process(target=read_imu, args=(q_imu,))
+    imu_proc.daemon = True
+    imu_proc.start()
+    time.sleep(1.5)
+    imu_warm = _sysid_wait_imu_ready(q_imu, timeout_sec=15.0)
+    if imu_warm is None:
+        try:
+            imu_proc.terminate()
+            imu_proc.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            servos.disable_torque(range(18))
+            servos.portHandler.closePort()
+        except Exception:
+            pass
+        raise RuntimeError("SysID Replay: IMU did not produce data.")
+
+    # Move to start pose: prefer metadata neutral, else CPG json, else first frame
+    if meta.get("neutral_target_deg") is not None:
+        neutral_deg = np.asarray(meta["neutral_target_deg"], dtype=np.float64).reshape(18)
+    else:
+        try:
+            with open(tick_json, "r") as f:
+                d = json.load(f)
+            gps = np.asarray(d["goal_pos_sim"])
+            neutral_deg = sim_angles_to_real(gps[0])
+        except Exception:
+            neutral_deg = traj[0].copy()
+
+    servos.Robot_initialize(neutral_deg)
+    time.sleep(0.8)
+    servos.Robot_initialize(traj[0])
+    time.sleep(0.5)
+
+    _stop = [False]
+
+    def _on_sigint(sn, fr):
+        _stop[0] = True
+        print("\n[SysID Replay] SIGINT, stopping...")
+
+    old_handler = _sig.signal(_sig.SIGINT, _on_sigint)
+
+    while not q_imu.empty():
+        try:
+            q_imu.get_nowait()
+        except Exception:
+            break
+
+    t_origin = time.perf_counter()
+    n_run = 0
+
+    try:
+        for step in range(T):
+            if _stop[0]:
+                break
+            t0 = time.perf_counter()
+            tgt = traj[step].copy()
+            tgt_tick = angles_to_tick(tgt)
+
+            if safety_enabled:
+                clamped = np.clip(
+                    tgt_tick, SYSID_SAFE_POS_MIN_TICK, SYSID_SAFE_POS_MAX_TICK
+                )
+                if not np.allclose(clamped, tgt_tick):
+                    print(f"[SysID Replay] SAFETY: clamping target at step {step}")
+                    tgt_tick = clamped
+
+            servos.write_all_positions(tgt_tick)
+            pd, vr, cm, pr, vrw, crw, pw, vv = sysid_read_all_sensors(servos)
+
+            if safety_enabled:
+                mc = int(np.max(np.abs(crw)))
+                if mc > SYSID_SAFE_CURRENT_ABS_RAW:
+                    print(f"[SysID Replay] SAFETY: current {mc} > limit, aborting")
+                    break
+
+            try:
+                while True:
+                    q_imu.get_nowait()
+            except _queue_std.Empty:
+                pass
+
+            n_run = step + 1
+            elapsed = time.perf_counter() - t0
+            if step % 50 == 0:
+                print(f"  [replay {step:05d}/{T}] loop={elapsed*1000:.1f}ms  "
+                      f"err={np.max(np.abs(pd - tgt)):.2f}deg")
+
+            wait = dt_use - elapsed
+            if wait > 0:
+                time.sleep(wait)
+    finally:
+        _sig.signal(_sig.SIGINT, old_handler)
+        try:
+            servos.disable_torque(range(18))
+        except Exception:
+            pass
+        try:
+            imu_proc.terminate()
+            imu_proc.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            servos.portHandler.closePort()
+        except Exception:
+            pass
+
+    print(f"[SysID Replay] Finished {n_run}/{T} steps in {time.perf_counter() - t_origin:.2f}s")
 
 
 # ============================================================================
@@ -1254,10 +1509,36 @@ if __name__ == '__main__':
                         help="Joint indices (comma-separated) or 'all'")
     parser.add_argument("--sysid-no-safety", action="store_true",
                         help="Disable safety checks (use with caution)")
+    parser.add_argument("--sysid-wm-obs", type=str, default="",
+                        help="wm_obs_prop.txt path: replay sim dof_pos on hardware "
+                             "and save SysID .npz (with --collect-sysid)")
+    parser.add_argument("--sysid-wm-obs-max-frames", type=int, default=None,
+                        help="Cap frames when using --sysid-wm-obs (default: full file)")
+    parser.add_argument("--replay-sysid", action="store_true",
+                        help="Replay joint trajectory from sysid .npz (see --sysid-file)")
+    parser.add_argument("--sysid-file", type=str, default="sysid_data.npz",
+                        help="Input .npz for --replay-sysid")
+    parser.add_argument("--sysid-replay-source", type=str, default="target",
+                        choices=["target", "measured"],
+                        help="target=q_target_deg (commands), measured=q_deg (feedback)")
+    parser.add_argument("--sysid-replay-dt", type=float, default=None,
+                        help="Control period for replay (default: metadata dt_s or median Δt)")
     args, _ = parser.parse_known_args()
+
+    # --- Replay saved SysID trajectory ---
+    if args.replay_sysid:
+        replay_sysid_data(
+            npz_path=args.sysid_file,
+            source=args.sysid_replay_source,
+            dt=args.sysid_replay_dt,
+            safety_enabled=not args.sysid_no_safety,
+            tick_json=args.tick_json,
+        )
+        sys.exit(0)
 
     # --- System Identification ---
     if args.collect_sysid:
+        wm_path = args.sysid_wm_obs.strip() or None
         collect_sysid_data(
             duration=args.sysid_duration,
             dt=args.sysid_dt,
@@ -1270,6 +1551,8 @@ if __name__ == '__main__':
             freq_end=args.sysid_freq_end,
             joint_indices=args.sysid_joints,
             safety_enabled=not args.sysid_no_safety,
+            wm_obs_path=wm_path,
+            wm_obs_max_frames=args.sysid_wm_obs_max_frames,
         )
         sys.exit(0)
 

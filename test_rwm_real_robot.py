@@ -63,18 +63,18 @@ sys.stdout = port_detector
 
 
 INTERPOLATION_STEPS = 1 # Simplified: no interpolation like CPGs
-TARGET_DT = 0.02  # 20ms = 50Hz like CPGs for higher control frequency
+TARGET_DT = 0.1  # 20ms = 50Hz like CPGs for higher control frequency
 MAX_STEPS = 1000
 # 策略输出逐维缩放（与 action 索引一致）：
 # [0:3] l1_bc,l1_cf,l1_ft  [3:6] l2  [6:9] l3  [9:12] r1  [12:15] r2  [15:18] r3
 ACTION_SCALE_PER_DIM = np.array(
     [
-        0.15, 0.15, 0.15,  # l1
-        0.15, 0.15, 0.15,  # l2
-        0.15, 0.15, 0.15,  # l3
-        0.15, 0.15, 0.15,  # r1
-        0.15, 0.15, 0.15,  # r2
-        0.15, 0.15, 0.15,  # r3
+        0.40, 0.40, 0.40,  # l1
+        0.40, 0.40, 0.40,  # l2
+        0.40, 0.40, 0.40,  # l3
+        0.40, 0.40, 0.40,  # r1
+        0.40, 0.40, 0.40,  # r2
+        0.40, 0.40, 0.40,  # r3
     ],
     dtype=np.float32,
 )
@@ -97,7 +97,67 @@ ENABLE_JOINT_LIMIT_PRINT = False
 # ------------------- Inference CPU tweaks (no model change) -------------------
 # 树莓派上可试 1~4；None 表示不调用 set_num_threads（沿用 PyTorch 默认）
 OPTIM_TORCH_NUM_THREADS = 2
+# 单线程推理时常设 1，避免多线程调度开销（与 OMP 配合试）
+OPTIM_TORCH_NUM_INTEROP_THREADS = 1
+# 同步设置常见 BLAS/OpenMP 线程（对 numpy/部分算子有效；最好在进程早期设置）
+OPTIM_ENV_OMP_THREADS = None  # 设为与 OPTIM_TORCH_NUM_THREADS 相同整数可试，例如 2
+
+# torch.compile：WM 编码器 + RSSM obs_step + 策略子模块（需 PyTorch 2.0+）
+WM_OPT_TORCH_COMPILE = True
+POLICY_OPT_TORCH_COMPILE = True
+WM_COMPILE_MODE = "default"  # CPU 可试 "reduce-overhead"；失败会自动回退
+
+# 仅编译 RSSM.obs_step（若 dynamo 对 dict 状态报错，可设 False 只保留 encoder 编译）
+WM_OPT_COMPILE_OBS_STEP = True
+
+# ONNX Runtime：仅替换 WM 的 MultiEncoder 前向（需: pip install onnx onnxruntime）
+# 为 True 时优先用 ORT，跳过对 encoder 的 torch.compile
+WM_OPT_ONNX_ENCODER = False
+# None = 自动保存到 checkpoint 同目录 wm_encoder.onnx
+WM_ONNX_EXPORT_PATH = None
 # ==============================================================================
+
+
+def apply_cpu_performance_settings(
+    num_threads=None,
+    num_interop_threads=None,
+    env_omp_threads=None,
+):
+    """
+    在加载大模型之前调用效果最佳。
+    env_omp_threads：若给定，同步设置 OMP/MKL/OpenBLAS/NUMEXPR（当前进程内）。
+    """
+    if num_threads is not None:
+        try:
+            torch.set_num_threads(int(num_threads))
+        except Exception:
+            pass
+    if num_interop_threads is not None:
+        try:
+            torch.set_num_interop_threads(int(num_interop_threads))
+        except Exception:
+            pass
+    if env_omp_threads is not None:
+        v = str(int(env_omp_threads))
+        for k in (
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+        ):
+            os.environ[k] = v
+
+
+class EncoderInferenceWrapper(torch.nn.Module):
+    """Tensor 输入，便于 torch.compile / ONNX 导出（与 MultiEncoder({'prop','is_first'}) 一致）。"""
+
+    def __init__(self, multi_encoder):
+        super().__init__()
+        self.encoder = multi_encoder
+
+    def forward(self, prop, is_first):
+        return self.encoder({"prop": prop, "is_first": is_first})
 
 # ---------------------------
 # Ankle asymmetric mapping (sim-to-real consistency)
@@ -212,19 +272,19 @@ def servo_angles_to_sim_angles(servo_angles_deg):
     # r1 leg (servo 3-5 -> sim 9-11)
     # Hip:   servo = 180 - sim → sim = 180 - servo
     sim_angles_deg[9] = 180.0 - servo_angles_deg[3]
-    # Knee:  servo = 180 - sim → sim = 180 - servo
-    sim_angles_deg[10] = 180.0 - servo_angles_deg[4]
+    # Knee:  servo = 180 + sim → sim = servo - 180
+    sim_angles_deg[10] = servo_angles_deg[4] - 180.0
     # Ankle: servo = 60  - sim → sim = 60  - servo
     sim_angles_deg[11] = 60.0 - servo_angles_deg[5]
 
     # r2 leg (servo 9-11 -> sim 12-14)
     sim_angles_deg[12] = 180.0 - servo_angles_deg[9]
-    sim_angles_deg[13] = 180.0 - servo_angles_deg[10]
+    sim_angles_deg[13] = servo_angles_deg[10] - 180.0
     sim_angles_deg[14] = 60.0 - servo_angles_deg[11]
 
     # r3 leg (servo 15-17 -> sim 15-17)
     sim_angles_deg[15] = 180.0 - servo_angles_deg[15]
-    sim_angles_deg[16] = 180.0 - servo_angles_deg[16]
+    sim_angles_deg[16] = servo_angles_deg[16] - 180.0
     sim_angles_deg[17] = 60.0 - servo_angles_deg[17]
 
     # Convert to radians
@@ -260,15 +320,15 @@ def sim_angles_rad_to_servo_angles_deg(sim_angles_rad):
     servo[14] = sim_deg[8] + 60.0
     # r1 (sim 9-11 -> servo 3-5)
     servo[3] = 180.0 - sim_deg[9]
-    servo[4] = 180.0 - sim_deg[10]   # right knee: servo = 180 - sim
+    servo[4] = 180.0 + sim_deg[10]   # right knee: servo = 180 + sim
     servo[5] = 60.0 - sim_deg[11]
     # r2 (sim 12-14 -> servo 9-11)
     servo[9] = 180.0 - sim_deg[12]
-    servo[10] = 180.0 - sim_deg[13]  # right knee: servo = 180 - sim
+    servo[10] = 180.0 + sim_deg[13]  # right knee: servo = 180 + sim
     servo[11] = 60.0 - sim_deg[14]
     # r3 (sim 15-17 -> servo 15-17)
     servo[15] = 180.0 - sim_deg[15]
-    servo[16] = 180.0 - sim_deg[16]  # right knee: servo = 180 - sim
+    servo[16] = 180.0 + sim_deg[16]  # right knee: servo = 180 + sim
     servo[17] = 60.0 - sim_deg[17]
     return servo
 
@@ -325,7 +385,7 @@ def get_action_limits():
     # Based on action_to_servo_angles mapping:
     # Hip joints: servo = 180 - action_deg => action_deg = 180 - servo
     # Left knee: servo = 180 - action_deg => action_deg = 180 - servo
-    # Right knee: servo = 180 - action_deg => action_deg = 180 - servo
+    # Right knee: servo = 180 + action_deg => action_deg = servo - 180
     # Left ankle: servo = 60 + action_deg => action_deg = servo - 60
     # Right ankle: servo = 60 - action_deg => action_deg = 60 - servo
 
@@ -360,24 +420,24 @@ def get_action_limits():
     # r1 leg actions (9-11) -> servo indices (3-5)
     action_min_deg[9] = 180.0 - servo_max[3]   # Hip: servo=180-sim → sim=180-servo
     action_max_deg[9] = 180.0 - servo_min[3]
-    action_min_deg[10] = 180.0 - servo_max[4]   # Right knee: servo=180-sim → sim=180-servo
-    action_max_deg[10] = 180.0 - servo_min[4]
+    action_min_deg[10] = servo_min[4] - 180.0   # Right knee: servo=180+sim → sim=servo-180
+    action_max_deg[10] = servo_max[4] - 180.0
     action_min_deg[11] = 60.0 - servo_max[5]   # Right ankle
     action_max_deg[11] = 60.0 - servo_min[5]
 
     # r2 leg actions (12-14) -> servo indices (9-11)
     action_min_deg[12] = 180.0 - servo_max[9]  # Hip
     action_max_deg[12] = 180.0 - servo_min[9]
-    action_min_deg[13] = 180.0 - servo_max[10]  # Right knee
-    action_max_deg[13] = 180.0 - servo_min[10]
+    action_min_deg[13] = servo_min[10] - 180.0  # Right knee: servo=180+sim → sim=servo-180
+    action_max_deg[13] = servo_max[10] - 180.0
     action_min_deg[14] = 60.0 - servo_max[11]  # Right ankle
     action_max_deg[14] = 60.0 - servo_min[11]
 
     # r3 leg actions (15-17) -> servo indices (15-17)
     action_min_deg[15] = 180.0 - servo_max[15] # Hip
     action_max_deg[15] = 180.0 - servo_min[15]
-    action_min_deg[16] = 180.0 - servo_max[16]  # Right knee
-    action_max_deg[16] = 180.0 - servo_min[16]
+    action_min_deg[16] = servo_min[16] - 180.0  # Right knee: servo=180+sim → sim=servo-180
+    action_max_deg[16] = servo_max[16] - 180.0
     action_min_deg[17] = 60.0 - servo_max[17]  # Right ankle
     action_max_deg[17] = 60.0 - servo_min[17]
 
@@ -386,7 +446,7 @@ def get_action_limits():
     action_max_rad = np.radians(action_max_deg)
 
     # Add safety margin to ensure servo angles stay strictly within limits
-    safety_margin_deg = 2.0  # 2.0 degree safety margin for reliability
+    safety_margin_deg = 1.0  # 2.0 degree safety margin for reliability
     safety_margin_rad = np.radians(safety_margin_deg)
 
     # Apply safety margins to all action limits
@@ -406,13 +466,13 @@ def get_action_limits():
         action_min_deg[action_idx] = 180.0 - (servo_max[servo_idx] - safety_margin_deg)
         action_max_deg[action_idx] = 180.0 - (servo_min[servo_idx] + safety_margin_deg)
 
-    # For right knee joints (servo = 180 - action): larger action -> smaller servo
+    # For right knee joints (servo = 180 + action): larger action -> larger servo
     right_knee_action_to_servo = {10: 4, 13: 10, 16: 16}  # r1, r2, r3 knees
     for action_idx, servo_idx in right_knee_action_to_servo.items():
-        # To ensure servo <= servo_max - margin, action >= 180 - (servo_max - margin)
-        action_min_deg[action_idx] = 180.0 - (servo_max[servo_idx] - safety_margin_deg)
-        # To ensure servo >= servo_min + margin, action <= 180 - (servo_min + margin)
-        action_max_deg[action_idx] = 180.0 - (servo_min[servo_idx] + safety_margin_deg)
+        # To ensure servo >= servo_min + margin, action >= (servo_min + margin) - 180
+        action_min_deg[action_idx] = (servo_min[servo_idx] + safety_margin_deg) - 180.0
+        # To ensure servo <= servo_max - margin, action <= (servo_max - margin) - 180
+        action_max_deg[action_idx] = (servo_max[servo_idx] - safety_margin_deg) - 180.0
 
     # For left ankle joints (servo = 60 + action): larger action -> larger servo
     # Map action indices to servo indices for left ankle joints
@@ -478,11 +538,8 @@ def action_to_servo_angles(actions_radians):
     servo_angles[2] = 150.0 + (actions_deg[2] - 90.0)
 
     # r1 leg (action 9-11 -> servo 3-5)
-    # Hip joint (idx 3): sim decreasing=positive, real increasing=positive → servo = 180 - sim
     servo_angles[3] = 180.0 - actions_deg[9]
-    # Knee joint (idx 4): real knee positive = angle decreases → servo = 180 - sim
-    servo_angles[4] = 180.0 - actions_deg[10]
-    # Ankle joint (idx 5): sim decreasing=positive, real increasing=positive → servo = 60 - sim
+    servo_angles[4] = 180.0 + actions_deg[10]   # right knee: servo = 180 + sim
     servo_angles[5] = 150.0 - (actions_deg[11] + 90.0)
 
     # l2 leg (action 3-5 -> servo 6-8)
@@ -494,11 +551,8 @@ def action_to_servo_angles(actions_radians):
     servo_angles[8] = 150.0 + (actions_deg[5] - 90.0)
 
     # r2 leg (action 12-14 -> servo 9-11)
-    # Hip joint (idx 9): sim decreasing=positive, real increasing=positive → servo = 180 - sim
     servo_angles[9] = 180.0 - actions_deg[12]
-    # Knee joint (idx 10): real knee positive = angle decreases → servo = 180 - sim
-    servo_angles[10] = 180.0 - actions_deg[13]
-    # Ankle joint (idx 11): sim decreasing=positive, real increasing=positive → servo = 60 - sim
+    servo_angles[10] = 180.0 + actions_deg[13]  # right knee: servo = 180 + sim
     servo_angles[11] = 150.0 - (actions_deg[14] + 90.0)
 
     # l3 leg (action 6-8 -> servo 12-14)
@@ -510,11 +564,8 @@ def action_to_servo_angles(actions_radians):
     servo_angles[14] = 150.0 + (actions_deg[8] - 90.0)
 
     # r3 leg (action 15-17 -> servo 15-17)
-    # Hip joint (idx 15): sim decreasing=positive, real increasing=positive → servo = 180 - sim
     servo_angles[15] = 180.0 - actions_deg[15]
-    # Knee joint (idx 16): real knee positive = angle decreases → servo = 180 - sim
-    servo_angles[16] = 180.0 - actions_deg[16]
-    # Ankle joint (idx 17): sim decreasing=positive, real increasing=positive → servo = 60 - sim
+    servo_angles[16] = 180.0 + actions_deg[16]  # right knee: servo = 180 + sim
     servo_angles[17] = 150.0 - (actions_deg[17] + 90.0)
 
     return servo_angles
@@ -562,6 +613,12 @@ class RealRobotRWMInference:
         """
         self.device = device
         self.remove_dof_vel = remove_dof_vel
+        self._model_path = model_path
+        # WM 推理优化（torch.compile / ONNX）运行时状态
+        self._wm_prop_dim = None
+        self._wm_encoder_wrapper = None
+        self._ort_encoder_session = None
+        self._compiled_obs_step = None
         print(f"Initializing RWM inference on device: {device}")
 
         # Model configuration (matching the actual checkpoint parameters)
@@ -584,10 +641,22 @@ class RealRobotRWMInference:
                     if k.startswith('module.'):
                         new_state_dict[k[7:]] = v  # Remove 'module.' prefix
                     else:
-                        new_state_dict[k] = v
+                        # torch.compile may save parameters under `*_orig_mod.*` namespaces.
+                        # Normalize keys so that we can load weights into the uncompiled module.
+                        kk = k.replace("._orig_mod.", ".")
+                        kk = kk.replace("_orig_mod.", "")
+                        new_state_dict[kk] = v
 
-                # Infer key dims from checkpoint to support different obs layouts (e.g. remove_dof_vel)
-                inferred_history_dim = new_state_dict.get('history_encoder.0.weight', torch.empty(0, 0)).shape[1] or 330
+                # Infer key dims from checkpoint to support different obs layouts (e.g. remove_dof_vel).
+                # If the checkpoint is missing some history-encoder keys, we must fall back to the
+                # expected history_dim from current runtime flags, otherwise inference will crash
+                # due to input feature mismatch.
+                inferred_history_dim = new_state_dict.get('history_encoder.0.weight', torch.empty(0, 0)).shape[1]
+                # training-side: history_length=5, obs_without_command_dim=(42 or 60) + (6 if cpg_reward)
+                expected_history_dim = ((42 if self.remove_dof_vel else 60) + (6 if cpg_reward else 0)) * 5
+                if not inferred_history_dim:
+                    inferred_history_dim = expected_history_dim
+
                 inferred_latent_dim = new_state_dict.get('history_encoder.4.weight', torch.empty(0, 0)).shape[0] or 35
                 inferred_wm_feature_dim = new_state_dict.get('wm_feature_encoder.0.weight', torch.empty(0, 0)).shape[1] or 512
                 inferred_wm_latent_dim = new_state_dict.get('wm_feature_encoder.4.weight', torch.empty(0, 0)).shape[0] or 32
@@ -612,7 +681,8 @@ class RealRobotRWMInference:
                     wm_latent_dim=int(inferred_wm_latent_dim),
                     cpg_reward_enabled=cpg_reward,
                     history_dim=self.history_dim,
-                    wm_feature_dim=self.wm_feature_dim
+                    wm_feature_dim=self.wm_feature_dim,
+                    prop_dim=self.obs_dim,
                 ).to(device)
 
                 # Load the cleaned state dict with strict=False to handle dimension mismatches
@@ -644,6 +714,28 @@ class RealRobotRWMInference:
                 print(f"Error loading model: {e}")
                 print("Using placeholder implementation")
                 self.model_loaded = False
+                # IMPORTANT: also build placeholder actor_critic so callers can still run.
+                # Previously, AttributeError could happen if torch.load failed and this branch didn't
+                # create `self.actor_critic` (because the placeholder construction lived only in the `else:`).
+                self.history_dim = (48 if self.remove_dof_vel else 66) * 5 if cpg_reward else (42 if self.remove_dof_vel else 60) * 5
+                self.wm_feature_dim = 512
+                self.actor_critic = ActorCriticRWM(
+                    num_actor_obs=self.obs_dim,
+                    num_critic_obs=246,
+                    num_actions=self.num_actions,
+                    encoder_hidden_dims=[256, 128],
+                    wm_encoder_hidden_dims=[64, 64],
+                    actor_hidden_dims=[256, 128, 64],
+                    critic_hidden_dims=[512, 256, 128],
+                    activation='elu',
+                    init_noise_std=1.0,
+                    latent_dim=35,
+                    wm_latent_dim=32,
+                    cpg_reward_enabled=cpg_reward,
+                    history_dim=self.history_dim,
+                    wm_feature_dim=self.wm_feature_dim,
+                    prop_dim=self.obs_dim,
+                ).to(device)
         else:
             print("No valid model path provided - using placeholder implementation")
             self.model_loaded = False
@@ -664,7 +756,8 @@ class RealRobotRWMInference:
                 wm_latent_dim=32,
                 cpg_reward_enabled=cpg_reward,
                 history_dim=self.history_dim,
-                wm_feature_dim=self.wm_feature_dim
+                wm_feature_dim=self.wm_feature_dim,
+                prop_dim=self.obs_dim,
             ).to(device)
 
         # Set model to evaluation mode
@@ -691,6 +784,10 @@ class RealRobotRWMInference:
             self.wm_action_history = torch.zeros((1, self.wm_update_interval, 18), device=self.device)
             self.wm_action = None
 
+        # torch.compile / ONNX / warmup（依赖 wm_is_first、wm_action_history）
+        if self.model_loaded:
+            self._setup_runtime_optimizations()
+
     def _init_world_model_from_checkpoint(self, checkpoint):
         """Load WorldModelRWM weights and infer action history length."""
         try:
@@ -706,6 +803,7 @@ class RealRobotRWMInference:
 
             # Infer prop_dim from encoder MLP weight (trained input dim)
             prop_dim = int(wm_sd["encoder._mlp.layers.Encoder_linear0.weight"].shape[1])
+            self._wm_prop_dim = prop_dim
 
             # Infer wm action history dim from RSSM img_in weight
             # inp_dim = stoch*discrete + num_actions
@@ -781,6 +879,172 @@ class RealRobotRWMInference:
             print(f"Warning: failed to init world model from checkpoint: {e}")
             self.world_model = None
 
+    def _compile_module_safe(self, module, name):
+        if not hasattr(torch, "compile"):
+            return module
+        try:
+            return torch.compile(module, mode=WM_COMPILE_MODE)
+        except Exception as e:
+            print(f"  {name}: torch.compile 跳过 ({e})")
+            return module
+
+    def _export_wm_encoder_onnx(self, path, prop_dim):
+        """导出 WM MultiEncoder 为 ONNX（固定 batch=1）。"""
+        wm = self.world_model
+        wrap = EncoderInferenceWrapper(wm.encoder).eval().to(self.device)
+        dummy_prop = torch.zeros(1, prop_dim, device=self.device, dtype=torch.float32)
+        dummy_first = torch.ones(1, device=self.device, dtype=torch.float32)
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        torch.onnx.export(
+            wrap,
+            (dummy_prop, dummy_first),
+            path,
+            input_names=["prop", "is_first"],
+            output_names=["embed"],
+            opset_version=17,
+            do_constant_folding=True,
+        )
+        print(f"  WM encoder ONNX 已导出: {path}")
+
+    def _wm_encoder_forward(self, prop_tensor):
+        """prop_tensor: [1, prop_dim]，与原先 encoder(wm_obs) 等价。"""
+        if self._ort_encoder_session is not None:
+            p = prop_tensor.detach().cpu().numpy().astype(np.float32)
+            f = self.wm_is_first.detach().cpu().numpy().astype(np.float32)
+            out = self._ort_encoder_session.run(None, {"prop": p, "is_first": f})[0]
+            return torch.from_numpy(np.asarray(out, dtype=np.float32)).to(self.device)
+        if self._wm_encoder_wrapper is not None:
+            return self._wm_encoder_wrapper(prop_tensor, self.wm_is_first)
+        return self.world_model.encoder({"prop": prop_tensor, "is_first": self.wm_is_first})
+
+    def _warmup_wm_inference(self, prop_dim):
+        """触发 torch.compile / ORT 首次构图，避免第一步实机卡顿。"""
+        wm = self.world_model
+        if wm is None or prop_dim is None:
+            return
+        saved_lat = self.wm_latent
+        saved_feat = self.wm_feature
+        saved_first = self.wm_is_first.clone()
+        if self.wm_action is None:
+            self.wm_action = self.wm_action_history.reshape(1, -1).clone()
+        try:
+            # 与 torch.compile/inductor 兼容：inference_mode 在部分 CPU 版 PyTorch 会触发
+            # "Inference tensors do not track version counter"，部署推理用 no_grad 即可。
+            with torch.no_grad():
+                dummy = torch.zeros(1, prop_dim, device=self.device, dtype=torch.float32)
+                obs_fn = self._compiled_obs_step or wm.dynamics.obs_step
+                for _ in range(3):
+                    emb = self._wm_encoder_forward(dummy)
+                    self.wm_latent, _ = obs_fn(
+                        self.wm_latent,
+                        self.wm_action,
+                        emb,
+                        self.wm_is_first,
+                        True,
+                    )
+        except Exception as e:
+            print(f"  WM warmup 跳过: {e}")
+        finally:
+            self.wm_latent = saved_lat
+            self.wm_feature = saved_feat
+            self.wm_is_first.copy_(saved_first)
+
+    def _setup_runtime_optimizations(self):
+        """torch.compile（策略+WM）、可选 ONNX encoder、warmup。"""
+        if not getattr(self, "model_loaded", False):
+            return
+
+        if POLICY_OPT_TORCH_COMPILE and hasattr(torch, "compile"):
+            try:
+                self.actor_critic.history_encoder = self._compile_module_safe(
+                    self.actor_critic.history_encoder, "history_encoder"
+                )
+                self.actor_critic.wm_feature_encoder = self._compile_module_safe(
+                    self.actor_critic.wm_feature_encoder, "wm_feature_encoder"
+                )
+                self.actor_critic.actor = self._compile_module_safe(
+                    self.actor_critic.actor, "actor"
+                )
+                print("  Policy: history_encoder / wm_feature_encoder / actor 已尝试 torch.compile")
+            except Exception as e:
+                print(f"  Policy torch.compile 失败: {e}")
+
+        wm = getattr(self, "world_model", None)
+        if wm is None:
+            return
+
+        prop_dim = getattr(self, "_wm_prop_dim", None)
+        if prop_dim is None:
+            print("  WM 优化跳过: 无 _wm_prop_dim")
+            return
+
+        # --- ONNX encoder（优先）---
+        if WM_OPT_ONNX_ENCODER:
+            try:
+                import onnxruntime as ort
+            except ImportError:
+                print("  WM ONNX: 未安装 onnxruntime，使用 PyTorch encoder")
+                ort = None
+            if ort is not None:
+                onnx_path = WM_ONNX_EXPORT_PATH
+                if onnx_path is None and self._model_path:
+                    onnx_path = os.path.join(
+                        os.path.dirname(os.path.abspath(self._model_path)),
+                        "wm_encoder.onnx",
+                    )
+                elif onnx_path is None:
+                    onnx_path = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        "wm_encoder.onnx",
+                    )
+                try:
+                    if not os.path.isfile(onnx_path):
+                        self._export_wm_encoder_onnx(onnx_path, prop_dim)
+                    so = ort.SessionOptions()
+                    try:
+                        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                    except Exception:
+                        pass
+                    nt = int(OPTIM_TORCH_NUM_THREADS) if OPTIM_TORCH_NUM_THREADS is not None else 2
+                    so.intra_op_num_threads = max(1, nt)
+                    so.inter_op_num_threads = 1
+                    self._ort_encoder_session = ort.InferenceSession(
+                        onnx_path, so, providers=["CPUExecutionProvider"]
+                    )
+                    print(f"  WM encoder: ONNX Runtime ({onnx_path})")
+                except Exception as e:
+                    print(f"  WM ONNX 失败，回退 PyTorch: {e}")
+                    self._ort_encoder_session = None
+
+        # --- torch.compile：encoder 包装 + obs_step（无 ONNX 时）---
+        if self._ort_encoder_session is None and WM_OPT_TORCH_COMPILE and hasattr(torch, "compile"):
+            try:
+                wrap = EncoderInferenceWrapper(wm.encoder).eval().to(self.device)
+                self._wm_encoder_wrapper = torch.compile(wrap, mode=WM_COMPILE_MODE)
+                print("  WM encoder: torch.compile(EncoderInferenceWrapper)")
+            except Exception as e:
+                print(f"  WM encoder compile 失败，使用 eager: {e}")
+                self._wm_encoder_wrapper = EncoderInferenceWrapper(wm.encoder).eval().to(self.device)
+            if WM_OPT_COMPILE_OBS_STEP:
+                try:
+                    self._compiled_obs_step = torch.compile(
+                        wm.dynamics.obs_step, mode=WM_COMPILE_MODE
+                    )
+                    print("  WM dynamics.obs_step: torch.compile")
+                except Exception as e:
+                    print(f"  WM obs_step compile 失败，使用 eager: {e}")
+                    self._compiled_obs_step = None
+            else:
+                self._compiled_obs_step = None
+                print("  WM dynamics.obs_step: 未编译 (WM_OPT_COMPILE_OBS_STEP=False)")
+        elif self._ort_encoder_session is None:
+            # 未启用 compile：仍用 wrapper 统一接口（与 ONNX 路径行为一致）
+            self._wm_encoder_wrapper = EncoderInferenceWrapper(wm.encoder).eval().to(self.device)
+
+        self._warmup_wm_inference(prop_dim)
+
     def get_inference_policy(self):
         """Get policy for inference"""
         return self._policy_inference
@@ -804,8 +1068,8 @@ class RealRobotRWMInference:
             return torch.randn(batch_size, action_dim, device=self.device) * 0.01
 
         try:
-            # Use the full ActorCriticRWM model for inference
-            with torch.inference_mode():
+            # Use the full ActorCriticRWM model for inference（no_grad 与 torch.compile 更兼容）
+            with torch.no_grad():
                 # Get deterministic actions by manually constructing the actor input
                 proprioceptive_obs = obs  # obs is already proprioceptive in our case
 
@@ -865,7 +1129,7 @@ class RealRobotRWMInference:
             return self.wm_feature
 
         try:
-            with torch.inference_mode():
+            with torch.no_grad():
                 # Update action history with prev_action (like playMBRL, wm_action is history of last K actions)
                 if prev_action is None:
                     self._prev_action_buf.zero_()
@@ -889,13 +1153,15 @@ class RealRobotRWMInference:
 
                 # Update world model latent every K steps (matches training update_interval)
                 if self.step_count % self.wm_update_interval == 0:
-                    wm_obs = {
-                        'prop': obs_dict['prop'].to(self.device),
-                        'is_first': self.wm_is_first,
-                    }
-                    wm_embed = self.world_model.encoder(wm_obs)
-                    self.wm_latent, _ = self.world_model.dynamics.obs_step(
-                        self.wm_latent, self.wm_action, wm_embed, self.wm_is_first, sample=True
+                    prop_t = obs_dict["prop"].to(self.device)
+                    wm_embed = self._wm_encoder_forward(prop_t)
+                    obs_fn = self._compiled_obs_step or self.world_model.dynamics.obs_step
+                    self.wm_latent, _ = obs_fn(
+                        self.wm_latent,
+                        self.wm_action,
+                        wm_embed,
+                        self.wm_is_first,
+                        True,
                     )
                     self.wm_feature = self.world_model.dynamics.get_deter_feat(self.wm_latent)
                     self.wm_is_first[:] = 0
@@ -982,7 +1248,17 @@ def onUpdate(deviceModel):
     q_imu_1.put(IMU_data)
 
 
-def create_observation_from_real_robot(servos, q_imu, step, history_length=5, cpg_reward=False, previous_actions=None):
+def create_observation_from_real_robot(
+    servos,
+    q_imu,
+    step,
+    history_length=5,
+    cpg_reward=False,
+    previous_actions=None,
+    imu_timeout_sec: float = 10.0,
+    imu_drain_max: int = 3,
+    imu_reinit_period_sec=None,
+):
     """
     Create observation from real robot sensors, matching the structure used in simulation.
     Based on hexapodMBRL.compute_observations()
@@ -1000,15 +1276,38 @@ def create_observation_from_real_robot(servos, q_imu, step, history_length=5, cp
             print(f"Warning: Failed to read joint velocities: {e}, using zeros")
             velocity_rads = np.zeros(18)
 
-    # Read IMU data like CPGs: blocking get with timeout, then drain queue for latest
+    # Read IMU data like CPGs: blocking get with timeout, then drain queue for latest.
+    # Online training may stall the main loop (WM training/torch compile). In that case
+    # the queue can be temporarily empty; to avoid long blocking we support a short timeout
+    # and fallback to the last received IMU measurement.
+    #
+    # First-call robustness: if we haven't got any IMU initialization/cache yet, we
+    # temporarily allow a longer timeout so drift-correction init isn't based on zeros.
+    effective_timeout_sec = float(imu_timeout_sec)
+    if (not hasattr(create_observation_from_real_robot, "imu_init")) and (not hasattr(create_observation_from_real_robot, "last_imu_data")):
+        effective_timeout_sec = max(effective_timeout_sec, 1.0)
     try:
-        IMU_data = q_imu.get(True, 10)  # Blocking get with 10s timeout (like CPGs)
-        while not q_imu.empty():
-            IMU_data = q_imu.get(True, 10)  # Get latest data
+        IMU_data = q_imu.get(True, effective_timeout_sec)
+        # Drain any additional queued measurements without blocking.
+        # This matters online training: when the main loop stalls, a lot of IMU
+        # messages may accumulate and draining them with timeouts can introduce
+        # noticeable latency/jitter.
+        drain_cnt = 0
+        while drain_cnt < int(imu_drain_max):
+            try:
+                IMU_data = q_imu.get(False)  # non-blocking
+                drain_cnt += 1
+            except Exception:
+                break
+        # Cache last successful IMU
+        create_observation_from_real_robot.last_imu_data = np.asarray(IMU_data, dtype=np.float32).copy()
     except:
         # If no IMU data available, use zeros
-        print("Warning: No IMU data available, using zeros")
-        IMU_data = np.zeros(9)
+        if hasattr(create_observation_from_real_robot, "last_imu_data"):
+            IMU_data = create_observation_from_real_robot.last_imu_data.copy()
+        else:
+            print("Warning: No IMU data available, using zeros")
+            IMU_data = np.zeros(9, dtype=np.float32)
 
     # Handle IMU initialization (for drift correction)
     if not hasattr(create_observation_from_real_robot, 'imu_init'):
@@ -1021,9 +1320,9 @@ def create_observation_from_real_robot(servos, q_imu, step, history_length=5, cp
 
     # Method 2: Periodic re-initialization every 10 seconds to reduce drift
     current_time = time.time()
-    if hasattr(create_observation_from_real_robot, 'imu_init_time'):
+    if imu_reinit_period_sec is not None and hasattr(create_observation_from_real_robot, 'imu_init_time'):
         time_since_init = current_time - create_observation_from_real_robot.imu_init_time
-        if time_since_init > 10.0:  # Re-initialize every 10 seconds
+        if time_since_init > float(imu_reinit_period_sec):
             print(f"Re-initializing IMU after {time_since_init:.1f} seconds to reduce drift")
             create_observation_from_real_robot.imu_init = IMU_data[0:3].copy()
             create_observation_from_real_robot.imu_init_time = current_time
@@ -1059,7 +1358,7 @@ def create_observation_from_real_robot(servos, q_imu, step, history_length=5, cp
     # print("projected gravity: ", projected_gravity)
 
     # Commands (fixed for real robot - can be modified for different behaviors)
-    commands = np.array([0.0, 0.050, 1.57])  # [lin_vel_x, lin_vel_y, ang_vel_yaw]
+    commands = np.array([0.0, 0.055, 1.57])  # [lin_vel_x, lin_vel_y, ang_vel_yaw]
 
     # Joint positions (convert servo angles to simulation joint angles matching action ranges)
     # Map servo angles to simulation joint angles that match the action space
@@ -1120,9 +1419,9 @@ def create_observation_from_real_robot(servos, q_imu, step, history_length=5, cp
     # Create proprioceptive features for RWM world model (order matches hexapodMBRL.compute_observations)
     # Order: base_ang_vel, projected_gravity, commands, dof_pos [, dof_vel], [phase_bool], obs_action
     if remove_dof_vel:
-        proprioceptive_obs = np.concatenate([base_ang_vel*0.05, projected_gravity, commands, dof_pos_scaled])
+        proprioceptive_obs = np.concatenate([base_ang_vel*0.030, projected_gravity, commands, dof_pos_scaled])
     else:
-        proprioceptive_obs = np.concatenate([base_ang_vel*0.05, projected_gravity, commands, dof_pos_scaled, dof_vel_scaled])
+        proprioceptive_obs = np.concatenate([base_ang_vel*0.030, projected_gravity, commands, dof_pos_scaled, dof_vel_scaled])
 
     prev_actions = previous_actions if previous_actions is not None else np.zeros(18)
 
@@ -1158,9 +1457,9 @@ def create_observation_from_real_robot(servos, q_imu, step, history_length=5, cp
     # Order must match hexapodMBRL.compute_observations(): ... dof_pos [, dof_vel], phase_bool, obs_action
     prev_actions = previous_actions if previous_actions is not None else np.zeros(18)
     if remove_dof_vel:
-        base_part = np.concatenate([base_ang_vel*0.05, projected_gravity, dof_pos_scaled])
+        base_part = np.concatenate([base_ang_vel*0.030, projected_gravity, dof_pos_scaled])
     else:
-        base_part = np.concatenate([base_ang_vel*0.05, projected_gravity, dof_pos_scaled, dof_vel_scaled])
+        base_part = np.concatenate([base_ang_vel*0.030, projected_gravity, dof_pos_scaled, dof_vel_scaled])
     if cpg_reward:
         obs_without_command = np.concatenate([base_part, phase_bool_current, prev_actions])  # ... phase_bool then previous_actions
     else:
@@ -1482,15 +1781,16 @@ def test_rwm_real_robot(model_path):
     print("🚀 Starting Robot Control - Port Error Detection ENABLED")
     print("="*60 + "\n")
 
+    # 在加载权重前设置线程与 OMP，利于 MatMul 与 ORT 一致
+    apply_cpu_performance_settings(
+        OPTIM_TORCH_NUM_THREADS,
+        OPTIM_TORCH_NUM_INTEROP_THREADS,
+        OPTIM_ENV_OMP_THREADS,
+    )
+
     # Initialize RWM inference
     rwm_inference = RealRobotRWMInference(model_path, device='cpu', remove_dof_vel=remove_dof_vel)
     policy = rwm_inference.get_inference_policy()
-
-    if OPTIM_TORCH_NUM_THREADS is not None:
-        try:
-            torch.set_num_threads(int(OPTIM_TORCH_NUM_THREADS))
-        except Exception:
-            pass
 
     # Initialize real robot components
     print("📍 Step 1: Initializing Servos...")
@@ -2205,7 +2505,11 @@ if __name__ == '__main__':
     else:
         # Path to your trained RWM model checkpoint
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(current_dir, 'world_model', 'asyresume_model_6000.pt')
+        model_path = os.path.join(current_dir, 'world_model', 'newact_model_2000.pt')
+        #model_path = os.path.join(current_dir, 'world_model', 'noac_model_3500.pt')
+        #model_path = os.path.join(current_dir, 'world_model', 'stage1_wm_only.pt')
+        #model_path = os.path.join(current_dir, 'world_model', 'stage2_imag_policy_epochs2000.pt')
+        #model_path = os.path.join(current_dir, 'world_model', 'asyresume_model_6000.pt')
         # model_path = os.path.join(current_dir, 'world_model', 'cpgtrack_model_5000.pt')
         # model_path = os.path.join(current_dir, 'world_model', 'model-remove-vel-9_20000.pt')
         # model_path = os.path.join(current_dir, 'world_model', 'model-cpg_10500.pt')
