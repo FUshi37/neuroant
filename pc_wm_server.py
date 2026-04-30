@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import os
 import socket
@@ -26,7 +27,15 @@ def _to_float_list(arr):
     return [float(x) for x in np.asarray(arr, dtype=np.float32).reshape(-1)]
 
 
-def run_server(host, port, model_path, remove_dof_vel=False, log_every=50, use_stability_filter=False):
+def run_server(
+    host,
+    port,
+    model_path,
+    remove_dof_vel=False,
+    log_every=50,
+    use_stability_filter=False,
+    filter_debug_path=None,
+):
     print(f"[PC] starting WM server at {host}:{port}")
     inference = RealRobotRWMInference(model_path, device="cpu", remove_dof_vel=remove_dof_vel)
     policy = inference.get_inference_policy()
@@ -48,79 +57,138 @@ def run_server(host, port, model_path, remove_dof_vel=False, log_every=50, use_s
     sock.bind((host, port))
     sock.settimeout(1.0)
 
-    packet_count = 0
-    while True:
-        try:
-            data, addr = sock.recvfrom(1024 * 1024)
-        except socket.timeout:
-            continue
+    if filter_debug_path is None:
+        filter_debug_path = os.path.join("validation_outputs", "filter_debug.csv")
+    os.makedirs(os.path.dirname(filter_debug_path) or ".", exist_ok=True)
+    debug_file = open(filter_debug_path, "w", newline="")
+    debug_writer = csv.DictWriter(
+        debug_file,
+        fieldnames=[
+            "step",
+            "filter_enabled",
+            "filter_used",
+            "best_idx",
+            "nominal_score",
+            "best_score",
+            "improvement",
+            "delta",
+            "num_samples",
+            "horizon",
+            "noise_scale",
+            "server_ms",
+            "action_min",
+            "action_max",
+            "action_mean",
+            "error",
+        ],
+    )
+    debug_writer.writeheader()
+    debug_file.flush()
+    print(f"[PC] filter debug will be logged to: {filter_debug_path}")
 
-        t0 = time.perf_counter()
-        try:
-            msg = json.loads(data.decode("utf-8"))
-            if msg.get("type") != "obs":
+    packet_count = 0
+    try:
+        while True:
+            try:
+                data, addr = sock.recvfrom(1024 * 1024)
+            except socket.timeout:
                 continue
 
-            step = int(msg["step"])
-            obs = np.asarray(msg["obs"], dtype=np.float32)
-            history = np.asarray(msg["history"], dtype=np.float32)
-            prev_action = msg.get("prev_action")
-            prev_action = None if prev_action is None else np.asarray(prev_action, dtype=np.float32)
+            t0 = time.perf_counter()
+            filter_debug = {"used": False, "error": ""}
+            try:
+                msg = json.loads(data.decode("utf-8"))
+                if msg.get("type") != "obs":
+                    continue
 
-            prop_t = torch.from_numpy(obs).unsqueeze(0)
-            history_t = torch.from_numpy(history).unsqueeze(0)
-            obs_dict = {"prop": prop_t, "is_first": inference.wm_is_first}
+                step = int(msg["step"])
+                obs = np.asarray(msg["obs"], dtype=np.float32)
+                history = np.asarray(msg["history"], dtype=np.float32)
+                prev_action = msg.get("prev_action")
+                prev_action = None if prev_action is None else np.asarray(prev_action, dtype=np.float32)
 
-            with torch.no_grad():
-                wm_feature = inference.update_world_model(obs_dict, prev_action)
-                actions = policy(obs_dict["prop"], history_t, wm_feature)
-                if stability_filter is not None and inference.wm_latent is not None:
-                    try:
-                        prev_action_t = (
-                            None
-                            if prev_action is None
-                            else torch.from_numpy(prev_action).unsqueeze(0)
-                        )
-                        actions = stability_filter.select_action(
-                            obs_prop=obs_dict["prop"],
-                            prev_latent=inference.wm_latent,
-                            action_nominal=actions,
-                            is_first=inference.wm_is_first,
-                            prev_action=prev_action_t,
-                        )
-                    except Exception as e:
-                        # Keep control alive if imagination branch fails.
-                        print(f"[PC] stability filter disabled for this step: {e}")
+                prop_t = torch.from_numpy(obs).unsqueeze(0)
+                history_t = torch.from_numpy(history).unsqueeze(0)
+                obs_dict = {"prop": prop_t, "is_first": inference.wm_is_first}
 
-            action_raw = actions.detach().cpu().numpy().reshape(-1)
-            action_raw = np.clip(action_raw, action_limits["min"], action_limits["max"])
+                with torch.no_grad():
+                    wm_feature = inference.update_world_model(obs_dict, prev_action)
+                    actions = policy(obs_dict["prop"], history_t, wm_feature)
+                    if stability_filter is not None and inference.wm_latent is not None:
+                        try:
+                            prev_action_t = (
+                                None
+                                if prev_action is None
+                                else torch.from_numpy(prev_action).unsqueeze(0)
+                            )
+                            actions = stability_filter.select_action(
+                                obs_prop=obs_dict["prop"],
+                                prev_latent=inference.wm_latent,
+                                action_nominal=actions,
+                                is_first=inference.wm_is_first,
+                                prev_action=prev_action_t,
+                            )
+                            filter_debug = dict(getattr(stability_filter, "last_debug", filter_debug))
+                        except Exception as e:
+                            # Keep control alive if imagination branch fails.
+                            filter_debug = {"used": False, "error": str(e)}
+                            print(f"[PC] stability filter disabled for this step: {e}")
 
-            resp = {
-                "type": "act",
-                "step": step,
-                "action_raw": _to_float_list(action_raw),
-                "server_ms": float((time.perf_counter() - t0) * 1000.0),
-                "ok": True,
-            }
-            packet_count += 1
-            if packet_count <= 5 or (packet_count % max(1, int(log_every))) == 0:
-                print(
-                    "[PC] "
-                    f"from={addr[0]}:{addr[1]} step={step} "
-                    f"act[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
-                    f"server={resp['server_ms']:.2f}ms"
-                )
-        except Exception as e:
-            resp = {
-                "type": "act",
-                "step": int(msg["step"]) if "msg" in locals() and "step" in msg else -1,
-                "action_raw": [0.0] * 18,
-                "ok": False,
-                "error": str(e),
-            }
-            print(f"[PC] inference error: {e}")
+                action_raw = actions.detach().cpu().numpy().reshape(-1)
+                action_raw = np.clip(action_raw, action_limits["min"], action_limits["max"])
+                server_ms = float((time.perf_counter() - t0) * 1000.0)
 
-        sock.sendto(json.dumps(resp).encode("utf-8"), addr)
+                resp = {
+                    "type": "act",
+                    "step": step,
+                    "action_raw": _to_float_list(action_raw),
+                    "server_ms": server_ms,
+                    "ok": True,
+                }
+                packet_count += 1
+
+                row = {
+                    "step": step,
+                    "filter_enabled": int(stability_filter is not None),
+                    "filter_used": int(bool(filter_debug.get("used", False))),
+                    "best_idx": filter_debug.get("best_idx", ""),
+                    "nominal_score": filter_debug.get("nominal_score", ""),
+                    "best_score": filter_debug.get("best_score", ""),
+                    "improvement": filter_debug.get("improvement", ""),
+                    "delta": filter_debug.get("delta", ""),
+                    "num_samples": filter_debug.get("num_samples", ""),
+                    "horizon": filter_debug.get("horizon", ""),
+                    "noise_scale": filter_debug.get("noise_scale", ""),
+                    "server_ms": server_ms,
+                    "action_min": float(action_raw.min()),
+                    "action_max": float(action_raw.max()),
+                    "action_mean": float(action_raw.mean()),
+                    "error": filter_debug.get("error", ""),
+                }
+                debug_writer.writerow(row)
+                if packet_count <= 5 or (packet_count % max(1, int(log_every))) == 0:
+                    debug_file.flush()
+                    print(
+                        "[PC] "
+                        f"from={addr[0]}:{addr[1]} step={step} "
+                        f"act[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
+                        f"server={server_ms:.2f}ms "
+                        f"filter_used={row['filter_used']} improve={row['improvement']} delta={row['delta']}"
+                    )
+            except Exception as e:
+                resp = {
+                    "type": "act",
+                    "step": int(msg["step"]) if "msg" in locals() and "step" in msg else -1,
+                    "action_raw": [0.0] * 18,
+                    "ok": False,
+                    "error": str(e),
+                }
+                print(f"[PC] inference error: {e}")
+
+            sock.sendto(json.dumps(resp).encode("utf-8"), addr)
+    finally:
+        debug_file.flush()
+        debug_file.close()
 
 
 def main():
@@ -131,6 +199,7 @@ def main():
     parser.add_argument("--remove-dof-vel", action="store_true")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--use-stability-filter", action="store_true")
+    parser.add_argument("--filter-debug-path", default=None)
     args = parser.parse_args()
     run_server(
         args.host,
@@ -139,6 +208,7 @@ def main():
         remove_dof_vel=args.remove_dof_vel,
         log_every=args.log_every,
         use_stability_filter=args.use_stability_filter,
+        filter_debug_path=args.filter_debug_path,
     )
 
 

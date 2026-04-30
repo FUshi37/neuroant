@@ -74,12 +74,12 @@ MAX_STEPS = 2000
 # [0:3] l1_bc,l1_cf,l1_ft  [3:6] l2  [6:9] l3  [9:12] r1  [12:15] r2  [15:18] r3
 ACTION_SCALE_PER_DIM = np.array(
     [
-        0.40, 0.40, 0.40,  # l1
-        0.40, 0.40, 0.40,  # l2
-        0.40, 0.40, 0.40,  # l3
-        0.40, 0.40, 0.40,  # r1
-        0.40, 0.40, 0.40,  # r2
-        0.40, 0.40, 0.40,  # r3
+        0.50, 0.50, 0.50,  # l1
+        0.50, 0.50, 0.50,  # l2
+        0.50, 0.50, 0.50,  # l3
+        0.50, 0.50, 0.50,  # r1
+        0.50, 0.50, 0.50,  # r2
+        0.50, 0.50, 0.50,  # r3
     ],
     dtype=np.float32,
 )
@@ -653,6 +653,7 @@ class _LegacyImaginationStabilityFilter:
         self.w_smooth = 0.08
         self.min_improvement = 0.02
         self.max_perturb = 0.20
+        self.last_debug = {}
 
     def _ensure_2d(self, x):
         if x is None:
@@ -986,6 +987,7 @@ class ImaginationStabilityFilter:
             action_nominal = self._ensure_2d(action_nominal).to(self.device, dtype=torch.float32)
             self._ensure_2d(obs_prop).to(self.device, dtype=torch.float32)
             prev_action_t = None if prev_action is None else self._ensure_2d(prev_action).to(self.device, dtype=torch.float32)
+            self.last_debug = {"used": False, "error": ""}
 
             # Include nominal action as candidate 0, then add bounded perturbations.
             n = self.num_samples
@@ -1008,9 +1010,25 @@ class ImaginationStabilityFilter:
             best_idx = torch.argmin(cand_scores)
             best_score = cand_scores[best_idx]
             nominal_score = cand_scores[0]
-            if not bool((nominal_score - best_score) > self.min_improvement):
+            selected = candidates[best_idx:best_idx + 1]
+            delta = torch.norm(selected - action_nominal, dim=-1)[0]
+            improvement = nominal_score - best_score
+            used = bool(improvement > self.min_improvement)
+            self.last_debug = {
+                "used": used,
+                "best_idx": int(best_idx.detach().cpu().item()),
+                "nominal_score": float(nominal_score.detach().cpu().item()),
+                "best_score": float(best_score.detach().cpu().item()),
+                "improvement": float(improvement.detach().cpu().item()),
+                "delta": float(delta.detach().cpu().item()),
+                "num_samples": int(candidates.shape[0]),
+                "horizon": int(self.horizon),
+                "noise_scale": float(self.noise_scale),
+                "error": "",
+            }
+            if not used:
                 return torch.clamp(action_nominal, -1.0, 1.0)
-            return candidates[best_idx:best_idx + 1]
+            return selected
 
 
 class RealRobotRWMInference:
@@ -2957,6 +2975,7 @@ if __name__ == '__main__':
         parser.add_argument("--remove-dof-vel", action="store_true")
         parser.add_argument("--log-every", type=int, default=50)
         parser.add_argument("--use-stability-filter", action="store_true")
+        parser.add_argument("--filter-debug-path", default=None)
         args = parser.parse_args()
 
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2968,6 +2987,7 @@ if __name__ == '__main__':
             remove_dof_vel=args.remove_dof_vel,
             log_every=args.log_every,
             use_stability_filter=args.use_stability_filter,
+            filter_debug_path=args.filter_debug_path,
         )
         sys.exit(0)
 
