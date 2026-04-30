@@ -624,7 +624,7 @@ class AdmittanceFilter:
         return self.q.copy()
 
 
-class ImaginationStabilityFilter:
+class _LegacyImaginationStabilityFilter:
     """Sampling-based safety filter using Dreamer RSSM imagination."""
 
     def __init__(
@@ -779,6 +779,236 @@ class ImaginationStabilityFilter:
             improved = (base_score - best_score) > self.min_improvement
 
             if not bool(improved):
+                return torch.clamp(action_nominal, -1.0, 1.0)
+            return candidates[best_idx:best_idx + 1]
+
+
+class ImaginationStabilityFilter:
+    """Sampling-based stability filter using Dreamer/RSSM imagination."""
+
+    def __init__(
+        self,
+        world_model,
+        action_dim=18,
+        horizon=5,
+        num_samples=8,
+        noise_scale=0.05,
+        device="cuda",
+    ):
+        """
+        world_model: contains encoder and dynamics.obs_step.
+        """
+        self.world_model = world_model
+        self.action_dim = int(action_dim)
+        self.horizon = min(int(horizon), 5)
+        self.num_samples = min(int(num_samples), 8)
+        self.noise_scale = float(noise_scale)
+        self.device = torch.device(device)
+        self.gravity_target = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32, device=self.device)
+
+        dynamics = getattr(world_model, "dynamics", None)
+        self.rssm_action_dim = int(getattr(dynamics, "_num_actions", self.action_dim))
+
+        # Orientation dominates; angular velocity and smoothness are secondary.
+        self.w_gravity = 1.0
+        self.w_ang_vel = 0.35
+        self.w_smooth = 0.08
+        self.min_improvement = 0.02
+        self.max_perturb = 0.20
+
+    def _ensure_2d(self, x):
+        if x is None:
+            return None
+        if not torch.is_tensor(x):
+            x = torch.as_tensor(x, dtype=torch.float32, device=self.device)
+        if x.dim() == 1:
+            return x.unsqueeze(0)
+        return x
+
+    def _repeat_latent(self, latent, n):
+        if isinstance(latent, dict):
+            return {
+                k: (v.repeat_interleave(n, dim=0) if torch.is_tensor(v) else v)
+                for k, v in latent.items()
+            }
+        if torch.is_tensor(latent):
+            return latent.repeat_interleave(n, dim=0)
+        raise TypeError(f"Unsupported latent type: {type(latent)}")
+
+    def _expand_action_for_rssm(self, action):
+        """Map 18-dim joint targets to the RSSM action input used by this checkpoint."""
+        action = self._ensure_2d(action).to(self.device, dtype=torch.float32)
+        if action.shape[-1] == self.rssm_action_dim:
+            return action
+        if self.rssm_action_dim == self.action_dim:
+            return action
+        if self.rssm_action_dim % self.action_dim == 0:
+            # Some checkpoints train RSSM on a short action-history vector.
+            return action.repeat(1, self.rssm_action_dim // self.action_dim)
+        raise ValueError(f"Cannot map action_dim={action.shape[-1]} to rssm_action_dim={self.rssm_action_dim}")
+
+    def _decoder_from_world_model(self):
+        if hasattr(self.world_model, "decoder"):
+            return self.world_model.decoder
+        heads = getattr(self.world_model, "heads", None)
+        if heads is not None and "decoder" in heads:
+            return heads["decoder"]
+        return None
+
+    def _dist_to_tensor(self, value):
+        if torch.is_tensor(value):
+            return value
+        mean = getattr(value, "mean", None)
+        if callable(mean):
+            return mean()
+        if torch.is_tensor(mean):
+            return mean
+        mode = getattr(value, "mode", None)
+        if callable(mode):
+            return mode()
+        raise TypeError(f"Cannot convert decoder output of type {type(value)} to tensor")
+
+    def _decode_prop(self, latent, obs_decoder=None):
+        """Decode imagined RSSM state to proprioceptive observation when a decoder is available."""
+        dynamics = self.world_model.dynamics
+        decoder = obs_decoder or self._decoder_from_world_model()
+        if decoder is None:
+            # Conservative fallback if no decoder is exposed.
+            feat = dynamics.get_deter_feat(latent)
+            return feat[:, :6]
+
+        feat = dynamics.get_feat(latent) if hasattr(dynamics, "get_feat") else dynamics.get_deter_feat(latent)
+        pred = decoder(feat)
+        if isinstance(pred, dict):
+            if "prop" not in pred:
+                raise KeyError("World-model decoder output has no 'prop' key.")
+            pred = pred["prop"]
+        return self._dist_to_tensor(pred)
+
+    def _infer_embed_dim(self):
+        dynamics = self.world_model.dynamics
+        deter_dim = int(getattr(dynamics, "_deter", 0))
+        obs_layers = getattr(dynamics, "_obs_out_layers", None)
+        if obs_layers is not None and len(obs_layers) > 0 and hasattr(obs_layers[0], "in_features"):
+            return int(obs_layers[0].in_features) - deter_dim
+        return 1024
+
+    def compute_stability(self, obs_prop, prev_action=None):
+        """
+        obs_prop: tensor containing base_ang_vel at [0:3] and projected_gravity at [3:6].
+
+        Instability score:
+        - projected_gravity deviation from [0, 0, -1]
+        - angular velocity magnitude
+        - optional action smoothness if obs_prop carries an action tail
+
+        Return: (B,) instability, higher is worse.
+        """
+        obs_prop = self._ensure_2d(obs_prop).to(self.device, dtype=torch.float32)
+        base_ang_vel = obs_prop[:, 0:3]
+        projected_gravity = obs_prop[:, 3:6]
+
+        gravity_dev = torch.norm(projected_gravity - self.gravity_target.unsqueeze(0), dim=-1)
+        ang_vel_mag = torch.norm(base_ang_vel, dim=-1)
+        instability = self.w_gravity * gravity_dev + self.w_ang_vel * ang_vel_mag
+
+        if prev_action is not None and obs_prop.shape[-1] >= self.action_dim:
+            prev_action = self._ensure_2d(prev_action).to(self.device, dtype=torch.float32)
+            cur_action = obs_prop[:, -self.action_dim:]
+            if prev_action.shape[0] == 1 and cur_action.shape[0] > 1:
+                prev_action = prev_action.repeat(cur_action.shape[0], 1)
+            instability = instability + self.w_smooth * torch.norm(cur_action - prev_action, dim=-1)
+
+        return instability
+
+    def rollout_imagination(self, prev_latent, action_candidates, is_first):
+        """
+        Perform parallel rollout for all action candidates.
+
+        No encoder is called here; this is pure Dreamer imagination.
+        """
+        dynamics = self.world_model.dynamics
+        n = action_candidates.shape[0]
+        latent = self._repeat_latent(prev_latent, n)
+        is_first = is_first.reshape(-1).to(self.device, dtype=torch.float32).repeat_interleave(n)
+        rssm_action = self._expand_action_for_rssm(action_candidates)
+
+        # Prefer the RSSM's vectorized imagination API if exposed by the world model.
+        if hasattr(dynamics, "imagine_with_action"):
+            try:
+                action_seq = rssm_action.unsqueeze(1).repeat(1, self.horizon, 1)
+                imagined = dynamics.imagine_with_action(action_seq, latent)
+                return [{k: v[:, t] for k, v in imagined.items()} for t in range(self.horizon)]
+            except Exception:
+                # Fall through to explicit img_step for slight interface/checkpoint differences.
+                pass
+
+        latent_seq = []
+        for _ in range(self.horizon):
+            if hasattr(dynamics, "img_step"):
+                latent = dynamics.img_step(latent, rssm_action, sample=True)
+            else:
+                # Fallback: obs_step with zero embed (no new real observation in imagination).
+                if isinstance(latent, dict):
+                    any_latent = next(v for v in latent.values() if torch.is_tensor(v))
+                    batch = any_latent.shape[0]
+                else:
+                    batch = latent.shape[0]
+                zero_embed = torch.zeros(batch, self._infer_embed_dim(), device=self.device, dtype=torch.float32)
+                latent, _ = dynamics.obs_step(latent, rssm_action, zero_embed, is_first, True)
+            latent_seq.append(latent)
+            is_first = torch.zeros_like(is_first)
+        return latent_seq
+
+    def evaluate_actions(self, prev_latent, action_candidates, is_first, obs_decoder=None):
+        """
+        For each candidate:
+        - rollout imagination
+        - compute instability over horizon
+        - use MAX instability (not sum)
+
+        Return:
+        - (N,) instability scores
+        """
+        with torch.no_grad():
+            latent_seq = self.rollout_imagination(prev_latent, action_candidates, is_first)
+            scores = []
+            for latent in latent_seq:
+                pred_prop = self._decode_prop(latent, obs_decoder=obs_decoder)
+                scores.append(self.compute_stability(pred_prop))
+            return torch.max(torch.stack(scores, dim=0), dim=0).values
+
+    def select_action(self, obs_prop, prev_latent, action_nominal, is_first, prev_action=None):
+        """
+        Perturb nominal action, evaluate imagined instability, select safest.
+        """
+        with torch.no_grad():
+            action_nominal = self._ensure_2d(action_nominal).to(self.device, dtype=torch.float32)
+            self._ensure_2d(obs_prop).to(self.device, dtype=torch.float32)
+            prev_action_t = None if prev_action is None else self._ensure_2d(prev_action).to(self.device, dtype=torch.float32)
+
+            # Include nominal action as candidate 0, then add bounded perturbations.
+            n = self.num_samples
+            noise = torch.randn(max(0, n - 1), self.action_dim, device=self.device) * self.noise_scale
+            noise = torch.clamp(noise, -self.max_perturb, self.max_perturb)
+            candidates = torch.cat([action_nominal, action_nominal.repeat(max(0, n - 1), 1) + noise], dim=0)
+            candidates = torch.clamp(candidates, -1.0, 1.0)
+
+            cand_scores = self.evaluate_actions(
+                prev_latent=prev_latent,
+                action_candidates=candidates,
+                is_first=is_first,
+                obs_decoder=self._decoder_from_world_model(),
+            )
+            if prev_action_t is not None:
+                cand_scores = cand_scores + self.w_smooth * torch.norm(
+                    candidates - prev_action_t.repeat(candidates.shape[0], 1), dim=-1
+                )
+
+            best_idx = torch.argmin(cand_scores)
+            best_score = cand_scores[best_idx]
+            nominal_score = cand_scores[0]
+            if not bool((nominal_score - best_score) > self.min_improvement):
                 return torch.clamp(action_nominal, -1.0, 1.0)
             return candidates[best_idx:best_idx + 1]
 
@@ -2690,6 +2920,57 @@ def verify_action_limits():
 
 if __name__ == '__main__':
     import sys
+    remote_ip = None
+    remote_port = 9876
+    if '--remote-wm-server-ip' in sys.argv:
+        idx = sys.argv.index('--remote-wm-server-ip')
+        if idx + 1 < len(sys.argv):
+            remote_ip = sys.argv[idx + 1]
+        else:
+            print("Usage: --remote-wm-server-ip <PC_IP> [--remote-wm-server-port <PORT>]")
+            sys.exit(1)
+    if '--remote-wm-server-port' in sys.argv:
+        idx = sys.argv.index('--remote-wm-server-port')
+        if idx + 1 < len(sys.argv):
+            remote_port = int(sys.argv[idx + 1])
+        else:
+            print("Usage: --remote-wm-server-port <PORT>")
+            sys.exit(1)
+
+    # Raspberry Pi remote-client mode: keep local one-process mode untouched when absent.
+    if remote_ip is not None:
+        from rpi_robot_client import run_client
+        print(f"Running remote WM client mode -> {remote_ip}:{remote_port}")
+        run_client(remote_ip, remote_port, timeout_s=0.05, log_every=50)
+        sys.exit(0)
+
+    # PC server mode for convenience. This reuses the dedicated UDP server implementation.
+    if '--pc-wm-server' in sys.argv:
+        import argparse
+        from pc_wm_server import run_server
+
+        parser = argparse.ArgumentParser(description="PC world-model inference server via test_rwm_real_robot_wm.py")
+        parser.add_argument("--pc-wm-server", action="store_true")
+        parser.add_argument("--host", default="0.0.0.0")
+        parser.add_argument("--port", type=int, default=9876)
+        parser.add_argument("--model-path", default=None)
+        parser.add_argument("--remove-dof-vel", action="store_true")
+        parser.add_argument("--log-every", type=int, default=50)
+        parser.add_argument("--use-stability-filter", action="store_true")
+        args = parser.parse_args()
+
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = args.model_path or os.path.join(current_dir, 'world_model', 'newact_model_2000.pt')
+        run_server(
+            args.host,
+            args.port,
+            model_path,
+            remove_dof_vel=args.remove_dof_vel,
+            log_every=args.log_every,
+            use_stability_filter=args.use_stability_filter,
+        )
+        sys.exit(0)
+
     if len(sys.argv) > 1:
         if sys.argv[1] == '--verify':
             verify_action_mapping()
@@ -2703,7 +2984,7 @@ if __name__ == '__main__':
             sim_path = sys.argv[2] if len(sys.argv) > 2 else None
             run_replay_sim_dof(sim_path)
         else:
-            print("Usage: python test_rwm_real_robot.py [--verify|--verify-limits|--verify-mapping|--imu-test|--replay-sim-dof [sim_data_path]]")
+            print("Usage: python test_rwm_real_robot_wm.py [--verify|--verify-limits|--verify-mapping|--imu-test|--replay-sim-dof [sim_data_path]|--remote-wm-server-ip <PC_IP> [--remote-wm-server-port <PORT>]|--pc-wm-server [--model-path PATH] [--host HOST] [--port PORT] [--remove-dof-vel] [--use-stability-filter]]")
     else:
         # Path to your trained RWM model checkpoint
         current_dir = os.path.dirname(os.path.abspath(__file__))
