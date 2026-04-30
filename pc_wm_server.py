@@ -17,7 +17,7 @@ def _to_float_list(arr):
     return [float(x) for x in np.asarray(arr, dtype=np.float32).reshape(-1)]
 
 
-def run_server(host, port, model_path, remove_dof_vel=False):
+def run_server(host, port, model_path, remove_dof_vel=False, log_every=50):
     print(f"[PC] starting WM server at {host}:{port}")
     inference = RealRobotRWMInference(model_path, device="cpu", remove_dof_vel=remove_dof_vel)
     policy = inference.get_inference_policy()
@@ -39,6 +39,7 @@ def run_server(host, port, model_path, remove_dof_vel=False):
     sock.bind((host, port))
     sock.settimeout(1.0)
 
+    packet_count = 0
     while True:
         try:
             data, addr = sock.recvfrom(1024 * 1024)
@@ -88,6 +89,14 @@ def run_server(host, port, model_path, remove_dof_vel=False):
                 "server_ms": float((time.perf_counter() - t0) * 1000.0),
                 "ok": True,
             }
+            packet_count += 1
+            if packet_count <= 5 or (packet_count % max(1, int(log_every))) == 0:
+                print(
+                    "[PC] "
+                    f"from={addr[0]}:{addr[1]} step={step} "
+                    f"act[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
+                    f"server={resp['server_ms']:.2f}ms"
+                )
         except Exception as e:
             resp = {
                 "type": "act",
@@ -96,6 +105,7 @@ def run_server(host, port, model_path, remove_dof_vel=False):
                 "ok": False,
                 "error": str(e),
             }
+            print(f"[PC] inference error: {e}")
 
         sock.sendto(json.dumps(resp).encode("utf-8"), addr)
 
@@ -106,8 +116,15 @@ def main():
     parser.add_argument("--port", type=int, default=9876)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--remove-dof-vel", action="store_true")
+    parser.add_argument("--log-every", type=int, default=50)
     args = parser.parse_args()
-    run_server(args.host, args.port, args.model_path, remove_dof_vel=args.remove_dof_vel)
+    run_server(
+        args.host,
+        args.port,
+        args.model_path,
+        remove_dof_vel=args.remove_dof_vel,
+        log_every=args.log_every,
+    )
 
 
 if __name__ == "__main__":

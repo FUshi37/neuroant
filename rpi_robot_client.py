@@ -32,7 +32,7 @@ ASYM_ANKLE_LIFT_RANGE_RAD = 1.0
 ASYM_ANKLE_SINK_RANGE_RAD = 0.10
 
 
-def _request_action(sock, server_addr, step, obs, history, prev_action, timeout_s=0.015):
+def _request_action(sock, server_addr, step, obs, history, prev_action, timeout_s=0.05):
     msg = {
         "type": "obs",
         "step": int(step),
@@ -47,7 +47,7 @@ def _request_action(sock, server_addr, step, obs, history, prev_action, timeout_
     return json.loads(data.decode("utf-8"))
 
 
-def run_client(server_ip, server_port):
+def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
     if HARDWARE_IMPORT_ERROR is not None:
         raise RuntimeError(f"hardware import failed: {HARDWARE_IMPORT_ERROR}")
 
@@ -87,6 +87,8 @@ def run_client(server_ip, server_port):
 
     prev_action_for_obs = None
     last_safe_action = np.zeros(18, dtype=np.float32)
+    net_ok_count = 0
+    net_fallback_count = 0
 
     try:
         for step in range(MAX_STEPS):
@@ -104,16 +106,25 @@ def run_client(server_ip, server_port):
                     obs=real_obs,
                     history=history_flat,
                     prev_action=prev_action_for_obs,
-                    timeout_s=0.015,
+                    timeout_s=timeout_s,
                 )
                 if resp.get("ok") and int(resp.get("step", -1)) == step:
                     action_raw = np.asarray(resp["action_raw"], dtype=np.float32)
                     last_safe_action = action_raw.copy()
+                    net_ok_count += 1
                 else:
                     action_raw = last_safe_action.copy()
+                    net_fallback_count += 1
+                    if (net_fallback_count <= 5) or (step % max(1, int(log_every)) == 0):
+                        print(
+                            f"[RPI] fallback step={step}: resp_ok={resp.get('ok')} resp_step={resp.get('step')}"
+                        )
             except Exception:
                 # network timeout / decode error fallback
                 action_raw = last_safe_action.copy()
+                net_fallback_count += 1
+                if (net_fallback_count <= 5) or (step % max(1, int(log_every)) == 0):
+                    print(f"[RPI] fallback step={step}: timeout/decode, using last_safe_action")
 
             action_for_obs = np.clip(action_raw, action_limits["min"], action_limits["max"])
             prev_action_for_obs = action_for_obs.copy()
@@ -145,8 +156,12 @@ def run_client(server_ip, server_port):
             while (time.time() - t_start) < TARGET_DT:
                 pass
 
-            if step % 50 == 0:
-                print(f"[RPI] step={step} net+ctrl ok")
+            if step % max(1, int(log_every)) == 0:
+                print(
+                    f"[RPI] step={step} "
+                    f"net_ok={net_ok_count} fallback={net_fallback_count} "
+                    f"raw[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}]"
+                )
     finally:
         try:
             servos.disable_torque(position_all)
@@ -167,8 +182,15 @@ def main():
     parser = argparse.ArgumentParser(description="Raspberry Pi robot control UDP client")
     parser.add_argument("--server-ip", required=True, help="PC IP running wm server")
     parser.add_argument("--server-port", type=int, default=9876)
+    parser.add_argument("--timeout-ms", type=float, default=50.0)
+    parser.add_argument("--log-every", type=int, default=50)
     args = parser.parse_args()
-    run_client(args.server_ip, args.server_port)
+    run_client(
+        args.server_ip,
+        args.server_port,
+        timeout_s=max(0.001, args.timeout_ms / 1000.0),
+        log_every=args.log_every,
+    )
 
 
 if __name__ == "__main__":
