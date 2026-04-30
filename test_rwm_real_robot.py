@@ -114,9 +114,13 @@ if os.environ.get("DISABLE_TORCH_COMPILE", "0") == "1":
     WM_OPT_TORCH_COMPILE = False
     POLICY_OPT_TORCH_COMPILE = False
 else:
-    has_native_compiler = any(
-        shutil.which(x) is not None for x in ("cl", "gcc", "g++", "cc", "clang", "clang++")
-    )
+    if platform.system().lower().startswith("win"):
+        # On Windows, torch.compile/inductor relies on MSVC cl.exe.
+        has_native_compiler = shutil.which("cl") is not None or shutil.which("cl.exe") is not None
+    else:
+        has_native_compiler = any(
+            shutil.which(x) is not None for x in ("gcc", "g++", "cc", "clang", "clang++")
+        )
     if not has_native_compiler:
         WM_OPT_TORCH_COMPILE = False
         POLICY_OPT_TORCH_COMPILE = False

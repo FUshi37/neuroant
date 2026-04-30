@@ -41,10 +41,25 @@ def _request_action(sock, server_addr, step, obs, history, prev_action, timeout_
         "prev_action": None if prev_action is None else [float(x) for x in prev_action],
         "ts": time.time(),
     }
+    # Drop any stale UDP packets in recv buffer before sending current request.
+    sock.settimeout(0.0)
+    try:
+        while True:
+            sock.recvfrom(1024 * 1024)
+    except Exception:
+        pass
+
     sock.sendto(json.dumps(msg).encode("utf-8"), server_addr)
-    sock.settimeout(timeout_s)
-    data, _ = sock.recvfrom(1024 * 1024)
-    return json.loads(data.decode("utf-8"))
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        remain = max(0.001, deadline - time.time())
+        sock.settimeout(remain)
+        data, _ = sock.recvfrom(1024 * 1024)
+        resp = json.loads(data.decode("utf-8"))
+        # Accept only response for current step; ignore stale delayed packets.
+        if int(resp.get("step", -1)) == int(step):
+            return resp
+    raise TimeoutError(f"no matched response for step={step}")
 
 
 def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
