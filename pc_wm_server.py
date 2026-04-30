@@ -1,10 +1,19 @@
 import argparse
 import json
+import os
 import socket
+import shutil
 import time
 
 import numpy as np
 import torch
+
+# On Windows hosts without MSVC, force eager mode before importing WM modules.
+if os.name == "nt":
+    has_cl = (shutil.which("cl") is not None) or (shutil.which("cl.exe") is not None)
+    if not has_cl:
+        os.environ["DISABLE_TORCH_COMPILE"] = "1"
+        print("[PC] cl.exe not found, forcing eager mode (DISABLE_TORCH_COMPILE=1)")
 
 from test_rwm_real_robot_wm import (
     ImaginationStabilityFilter,
@@ -17,7 +26,7 @@ def _to_float_list(arr):
     return [float(x) for x in np.asarray(arr, dtype=np.float32).reshape(-1)]
 
 
-def run_server(host, port, model_path, remove_dof_vel=False, log_every=50):
+def run_server(host, port, model_path, remove_dof_vel=False, log_every=50, use_stability_filter=False):
     print(f"[PC] starting WM server at {host}:{port}")
     inference = RealRobotRWMInference(model_path, device="cpu", remove_dof_vel=remove_dof_vel)
     policy = inference.get_inference_policy()
@@ -30,7 +39,7 @@ def run_server(host, port, model_path, remove_dof_vel=False, log_every=50):
             noise_scale=0.05,
             device="cpu",
         )
-        if inference.world_model is not None
+        if (use_stability_filter and inference.world_model is not None)
         else None
     )
     action_limits = get_action_limits()
@@ -66,18 +75,22 @@ def run_server(host, port, model_path, remove_dof_vel=False, log_every=50):
                 wm_feature = inference.update_world_model(obs_dict, prev_action)
                 actions = policy(obs_dict["prop"], history_t, wm_feature)
                 if stability_filter is not None and inference.wm_latent is not None:
-                    prev_action_t = (
-                        None
-                        if prev_action is None
-                        else torch.from_numpy(prev_action).unsqueeze(0)
-                    )
-                    actions = stability_filter.select_action(
-                        obs_prop=obs_dict["prop"],
-                        prev_latent=inference.wm_latent,
-                        action_nominal=actions,
-                        is_first=inference.wm_is_first,
-                        prev_action=prev_action_t,
-                    )
+                    try:
+                        prev_action_t = (
+                            None
+                            if prev_action is None
+                            else torch.from_numpy(prev_action).unsqueeze(0)
+                        )
+                        actions = stability_filter.select_action(
+                            obs_prop=obs_dict["prop"],
+                            prev_latent=inference.wm_latent,
+                            action_nominal=actions,
+                            is_first=inference.wm_is_first,
+                            prev_action=prev_action_t,
+                        )
+                    except Exception as e:
+                        # Keep control alive if imagination branch fails.
+                        print(f"[PC] stability filter disabled for this step: {e}")
 
             action_raw = actions.detach().cpu().numpy().reshape(-1)
             action_raw = np.clip(action_raw, action_limits["min"], action_limits["max"])
@@ -117,6 +130,7 @@ def main():
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--remove-dof-vel", action="store_true")
     parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--use-stability-filter", action="store_true")
     args = parser.parse_args()
     run_server(
         args.host,
@@ -124,6 +138,7 @@ def main():
         args.model_path,
         remove_dof_vel=args.remove_dof_vel,
         log_every=args.log_every,
+        use_stability_filter=args.use_stability_filter,
     )
 
 

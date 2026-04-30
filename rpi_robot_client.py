@@ -83,6 +83,10 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
     neutral_angles = ROBOT_CONFIG["neutral_angles"]
     real_angles = radians_to_degrees(neutral_angles * np.pi / 180.0)
     servos.Robot_initialize(real_angles)
+    # Match local mode UX: reach initial pose first, then wait for explicit start.
+    print("[RPI] Robot moved to initial pose. Press Enter to start control, or Ctrl+C to abort.")
+    input()
+    time.sleep(0.8)
 
     history_length = 5
     remove_dof_vel = True

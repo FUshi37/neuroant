@@ -3,6 +3,7 @@ import os
 import time
 import math
 import platform
+import shutil
 import torch
 import numpy as np
 from collections import deque
@@ -110,6 +111,24 @@ OPTIM_ENV_OMP_THREADS = None  # 设为与 OPTIM_TORCH_NUM_THREADS 相同整数�
 WM_OPT_TORCH_COMPILE = True
 POLICY_OPT_TORCH_COMPILE = True
 WM_COMPILE_MODE = "default"  # CPU 可试 "reduce-overhead"；失败会自动回退
+
+# Auto-disable torch.compile when no native compiler is available.
+# This avoids runtime fallback-to-safe-actions on environments lacking toolchains.
+if os.environ.get("DISABLE_TORCH_COMPILE", "0") == "1":
+    WM_OPT_TORCH_COMPILE = False
+    POLICY_OPT_TORCH_COMPILE = False
+else:
+    if platform.system().lower().startswith("win"):
+        # On Windows, torch.compile/inductor relies on MSVC cl.exe.
+        has_native_compiler = shutil.which("cl") is not None or shutil.which("cl.exe") is not None
+    else:
+        has_native_compiler = any(
+            shutil.which(x) is not None for x in ("gcc", "g++", "cc", "clang", "clang++")
+        )
+    if not has_native_compiler:
+        WM_OPT_TORCH_COMPILE = False
+        POLICY_OPT_TORCH_COMPILE = False
+        print("Warning: no native compiler detected, torch.compile disabled.")
 
 # 仅编译 RSSM.obs_step（若 dynamo 对 dict 状态报错，可设 False 只保留 encoder 编译）
 WM_OPT_COMPILE_OBS_STEP = True
