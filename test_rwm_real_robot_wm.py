@@ -99,6 +99,15 @@ ENABLE_ACTION_CLIP_PRINT = False
 ENABLE_JOINT_LIMIT_PRINT = False
 # ======================================================================
 
+# ==================== Contact anomaly detection switches ====================
+# Toggle world-model-prior based contact anomaly detection/action correction.
+ENABLE_CONTACT_ANOMALY_DETECTOR = True
+CONTACT_ANOMALY_THRESHOLD = 0.15
+CONTACT_ANOMALY_EMA_ALPHA = 0.90
+CONTACT_ANOMALY_TRIGGER_COUNT = 3
+CONTACT_ANOMALY_ACTION_SCALE = 0.70
+# ============================================================================
+
 # ------------------- Inference CPU tweaks (no model change) -------------------
 # 树莓派上可试 1~4；None 表示不调用 set_num_threads（沿用 PyTorch 默认）
 OPTIM_TORCH_NUM_THREADS = 2
@@ -1029,6 +1038,155 @@ class ImaginationStabilityFilter:
             if not used:
                 return torch.clamp(action_nominal, -1.0, 1.0)
             return selected
+
+
+class ContactAnomalyDetector:
+    """World-model prior based contact anomaly detector for real-time control."""
+
+    def __init__(
+        self,
+        world_model,
+        threshold=0.15,
+        ema_alpha=0.9,
+        trigger_count=3,
+        action_dim=18,
+        device="cuda",
+    ):
+        self.world_model = world_model
+        self.threshold = float(threshold)
+        self.ema_alpha = float(ema_alpha)
+        self.trigger_count = int(trigger_count)
+        self.action_dim = int(action_dim)
+        self.device = torch.device(device)
+
+        self.ema_error = None
+        self.anomaly_counter = 0
+        self._rssm_action_dim = self._infer_rssm_action_dim()
+
+    def _infer_rssm_action_dim(self):
+        dynamics = getattr(self.world_model, "dynamics", None)
+        return int(getattr(dynamics, "_num_actions", self.action_dim))
+
+    def _ensure_2d(self, x):
+        if x.dim() == 1:
+            return x.unsqueeze(0)
+        return x
+
+    def _expand_action_for_rssm(self, action):
+        action = self._ensure_2d(action).to(self.device, dtype=torch.float32)
+        if action.shape[-1] == self._rssm_action_dim:
+            return action
+        if self._rssm_action_dim == self.action_dim:
+            return action
+        if self._rssm_action_dim % self.action_dim == 0:
+            repeat = self._rssm_action_dim // self.action_dim
+            return action.repeat(1, repeat)
+        raise ValueError(
+            f"Cannot map action_dim={action.shape[-1]} to rssm_action_dim={self._rssm_action_dim}"
+        )
+
+    def _dist_to_tensor(self, value):
+        if torch.is_tensor(value):
+            return value
+        mean = getattr(value, "mean", None)
+        if callable(mean):
+            return mean()
+        if torch.is_tensor(mean):
+            return mean
+        mode = getattr(value, "mode", None)
+        if callable(mode):
+            return mode()
+        raise TypeError(f"Cannot convert decoder output of type {type(value)} to tensor")
+
+    @torch.no_grad()
+    def predict_next_obs(self, prev_latent, action, obs_dict):
+        """
+        Use PRIOR from obs_step to predict next observation:
+        1) encoder(obs_dict) -> embed
+        2) obs_step(prev_latent, action, embed) -> (posterior, prior)
+        3) decode prior branch (not posterior) for anomaly prediction
+        """
+        prop = obs_dict["prop"].to(self.device, dtype=torch.float32)
+        is_first = obs_dict["is_first"].to(self.device, dtype=torch.float32)
+        obs_for_wm = {"prop": prop, "is_first": is_first}
+
+        embed = self.world_model.encoder(obs_for_wm)
+        rssm_action = self._expand_action_for_rssm(action)
+        latent_post, latent_prior = self.world_model.dynamics.obs_step(
+            prev_latent,
+            rssm_action,
+            embed,
+            is_first,
+            sample=True,
+        )
+
+        feat = self.world_model.dynamics.get_feat(latent_prior)
+        pred = self.world_model.heads["decoder"](feat)
+        if isinstance(pred, dict):
+            if "prop" not in pred:
+                raise KeyError("Decoder prediction has no 'prop' key.")
+            obs_pred = pred["prop"]
+        else:
+            obs_pred = pred
+        obs_pred = self._dist_to_tensor(obs_pred)
+        return obs_pred, latent_post
+
+    def compute_error(self, obs_real, obs_pred):
+        """
+        Compute weighted L2 error on partial observation only:
+        - base_ang_vel [0:3]
+        - projected_gravity [3:6]
+        Commands/dof states are excluded to focus contact-related dynamics.
+        """
+        obs_real = self._ensure_2d(obs_real).to(self.device, dtype=torch.float32)
+        obs_pred = self._ensure_2d(obs_pred).to(self.device, dtype=torch.float32)
+
+        ang_real = obs_real[..., 0:3]
+        ang_pred = obs_pred[..., 0:3]
+        grav_real = obs_real[..., 3:6]
+        grav_pred = obs_pred[..., 3:6]
+
+        ang_err = torch.norm(ang_real - ang_pred, dim=-1)
+        grav_err = torch.norm(grav_real - grav_pred, dim=-1)
+        return grav_err + 0.3 * ang_err
+
+    @torch.no_grad()
+    def detect(self, prev_latent, action, obs_dict):
+        """
+        Return:
+        - is_anomaly (bool)
+        - smoothed_error (float)
+        - latent_post (for next-step state update)
+        EMA is used to suppress one-frame sensor noise and avoid false triggers.
+        """
+        obs_real = obs_dict["prop"].to(self.device, dtype=torch.float32)
+        obs_pred, latent_post = self.predict_next_obs(prev_latent, action, obs_dict)
+        error = self.compute_error(obs_real, obs_pred)
+
+        if self.ema_error is None:
+            self.ema_error = error.detach()
+        else:
+            self.ema_error = self.ema_alpha * self.ema_error + (1.0 - self.ema_alpha) * error
+
+        trigger = bool(torch.any(self.ema_error > self.threshold).item())
+        if trigger:
+            self.anomaly_counter += 1
+        else:
+            self.anomaly_counter = 0
+        is_anomaly = self.anomaly_counter >= self.trigger_count
+        smoothed_error = float(torch.max(self.ema_error).item())
+        return is_anomaly, smoothed_error, latent_post
+
+
+def adjust_action(action, is_anomaly, scale=0.7):
+    """
+    Safe fallback:
+    - keep action direction
+    - reduce magnitude when anomaly persists
+    """
+    if is_anomaly:
+        return action * float(scale)
+    return action
 
 
 class RealRobotRWMInference:
@@ -2230,6 +2388,17 @@ def test_rwm_real_robot_wm(model_path):
         noise_scale=0.05,
         device='cpu',
     ) if rwm_inference.world_model is not None else None
+    contact_detector = ContactAnomalyDetector(
+        world_model=rwm_inference.world_model,
+        threshold=CONTACT_ANOMALY_THRESHOLD,
+        ema_alpha=CONTACT_ANOMALY_EMA_ALPHA,
+        trigger_count=CONTACT_ANOMALY_TRIGGER_COUNT,
+        action_dim=18,
+        device='cpu',
+    ) if (ENABLE_CONTACT_ANOMALY_DETECTOR and rwm_inference.world_model is not None) else None
+    detector_latent = rwm_inference.wm_latent
+    detector_last_error = 0.0
+    detector_last_anomaly = False
 
     # Initialize real robot components
     print("📍 Step 1: Initializing Servos...")
@@ -2518,7 +2687,8 @@ def test_rwm_real_robot_wm(model_path):
                 #print("obs_dict['prop']: ", obs_dict["prop"])
                 #print("history_tensor: ", history_tensor)
                 #print("wm_feature: ", wm_feature)
-                actions = policy(obs_dict["prop"], history_tensor, wm_feature)
+                action_nominal = policy(obs_dict["prop"], history_tensor, wm_feature)
+                actions = action_nominal
                 if stability_filter is not None and rwm_inference.wm_latent is not None:
                     prev_action_t = None if previous_actions is None else torch.from_numpy(
                         np.asarray(previous_actions, dtype=np.float32)
@@ -2530,6 +2700,20 @@ def test_rwm_real_robot_wm(model_path):
                         is_first=rwm_inference.wm_is_first,
                         prev_action=prev_action_t,
                     )
+                if contact_detector is not None:
+                    if detector_latent is None:
+                        detector_latent = rwm_inference.wm_latent
+                    if detector_latent is not None:
+                        detector_last_anomaly, detector_last_error, detector_latent = contact_detector.detect(
+                            prev_latent=detector_latent,
+                            action=action_nominal,
+                            obs_dict=obs_dict,
+                        )
+                        actions = adjust_action(
+                            actions,
+                            detector_last_anomaly,
+                            scale=CONTACT_ANOMALY_ACTION_SCALE,
+                        )
                 #print("actions: ", actions)
 
                 # For obs_without_command (next step): use clip-only, before scale and before asymmetric mapping (align with sim)
