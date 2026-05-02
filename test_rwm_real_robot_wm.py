@@ -106,6 +106,8 @@ CONTACT_ANOMALY_THRESHOLD = 0.15
 CONTACT_ANOMALY_EMA_ALPHA = 0.90
 CONTACT_ANOMALY_TRIGGER_COUNT = 3
 CONTACT_ANOMALY_ACTION_SCALE = 0.70
+CONTACT_ANOMALY_LIFT_GAIN = 0.20
+CONTACT_ANOMALY_MAX_LIFT_GAIN = 0.60
 # ============================================================================
 
 # ------------------- Inference CPU tweaks (no model change) -------------------
@@ -1041,7 +1043,7 @@ class ImaginationStabilityFilter:
 
 
 class ContactAnomalyDetector:
-    """World-model prior based contact anomaly detector for real-time control."""
+    """World-model PRIOR based contact anomaly detector for real-time control."""
 
     def __init__(
         self,
@@ -1105,6 +1107,10 @@ class ContactAnomalyDetector:
         1) encoder(obs_dict) -> embed
         2) obs_step(prev_latent, action, embed) -> (posterior, prior)
         3) decode prior branch (not posterior) for anomaly prediction
+
+        PRIOR is used because it is the model's prediction before conditioning on
+        the current real observation. A large prior-vs-real mismatch indicates
+        unexpected contact/slip/disturbance.
         """
         prop = obs_dict["prop"].to(self.device, dtype=torch.float32)
         is_first = obs_dict["is_first"].to(self.device, dtype=torch.float32)
@@ -1136,7 +1142,10 @@ class ContactAnomalyDetector:
         Compute weighted L2 error on partial observation only:
         - base_ang_vel [0:3]
         - projected_gravity [3:6]
-        Commands/dof states are excluded to focus contact-related dynamics.
+
+        Commands and joint states are intentionally ignored. Contact anomalies
+        should show up first as unexpected body angular velocity/orientation
+        change, while commanded motion and leg phase can vary normally.
         """
         obs_real = self._ensure_2d(obs_real).to(self.device, dtype=torch.float32)
         obs_pred = self._ensure_2d(obs_pred).to(self.device, dtype=torch.float32)
@@ -1155,9 +1164,12 @@ class ContactAnomalyDetector:
         """
         Return:
         - is_anomaly (bool)
-        - smoothed_error (float)
+        - ema_error (tensor)
         - latent_post (for next-step state update)
-        EMA is used to suppress one-frame sensor noise and avoid false triggers.
+        - anomaly_counter (consecutive trigger count)
+
+        EMA suppresses one-frame sensor noise. The consecutive trigger prevents
+        single bad packets or transient impacts from immediately changing gait.
         """
         obs_real = obs_dict["prop"].to(self.device, dtype=torch.float32)
         obs_pred, latent_post = self.predict_next_obs(prev_latent, action, obs_dict)
@@ -1166,7 +1178,10 @@ class ContactAnomalyDetector:
         if self.ema_error is None:
             self.ema_error = error.detach()
         else:
-            self.ema_error = self.ema_alpha * self.ema_error + (1.0 - self.ema_alpha) * error
+            self.ema_error = (
+                self.ema_alpha * self.ema_error
+                + (1.0 - self.ema_alpha) * error.detach()
+            )
 
         trigger = bool(torch.any(self.ema_error > self.threshold).item())
         if trigger:
@@ -1174,19 +1189,47 @@ class ContactAnomalyDetector:
         else:
             self.anomaly_counter = 0
         is_anomaly = self.anomaly_counter >= self.trigger_count
-        smoothed_error = float(torch.max(self.ema_error).item())
-        return is_anomaly, smoothed_error, latent_post
+        return is_anomaly, self.ema_error, latent_post, self.anomaly_counter
 
 
-def adjust_action(action, is_anomaly, scale=0.7):
+def adjust_action(
+    action,
+    is_anomaly,
+    anomaly_steps,
+    base_scale=0.7,
+    lift_gain=0.2,
+    max_lift_gain=0.6,
+):
     """
-    Safe fallback:
-    - keep action direction
-    - reduce magnitude when anomaly persists
+    Joint-space recovery strategy.
+
+    Strategy:
+    1. Stabilize by scaling down the policy action.
+    2. Lift legs to escape unexpected ground contact / obstacle contact.
+    3. Increase lift progressively if the anomaly persists.
+
+    Coordinate convention in this codebase:
+    - ankle lift direction: left ankles [2,5,8] are +, right ankles [11,14,17] are -
+    - knee assist direction: left knees [1,4,7] bend/lift with -, right knees [10,13,16] with +
+
+    Ankles are the primary lifting joints; knees are added with a smaller gain
+    to help leg clearance without over-folding the leg.
     """
-    if is_anomaly:
-        return action * float(scale)
-    return action
+    if not is_anomaly:
+        return action
+
+    recovered = action * float(base_scale)
+    gain = float(lift_gain) * (1.0 + 0.5 * float(anomaly_steps))
+    gain = min(gain, float(max_lift_gain))
+
+    ankle_idx = torch.tensor([2, 5, 8, 11, 14, 17], device=recovered.device, dtype=torch.long)
+    ankle_dir = torch.tensor([1, 1, 1, -1, -1, -1], device=recovered.device, dtype=recovered.dtype)
+    knee_idx = torch.tensor([1, 4, 7, 10, 13, 16], device=recovered.device, dtype=torch.long)
+    knee_dir = torch.tensor([-1, -1, -1, 1, 1, 1], device=recovered.device, dtype=recovered.dtype)
+
+    recovered[..., ankle_idx] = recovered[..., ankle_idx] + gain * ankle_dir
+    recovered[..., knee_idx] = recovered[..., knee_idx] + (0.35 * gain) * knee_dir
+    return torch.clamp(recovered, -1.0, 1.0)
 
 
 class RealRobotRWMInference:
@@ -2397,8 +2440,9 @@ def test_rwm_real_robot_wm(model_path):
         device='cpu',
     ) if (ENABLE_CONTACT_ANOMALY_DETECTOR and rwm_inference.world_model is not None) else None
     detector_latent = rwm_inference.wm_latent
-    detector_last_error = 0.0
+    detector_last_error = None
     detector_last_anomaly = False
+    detector_last_steps = 0
 
     # Initialize real robot components
     print("📍 Step 1: Initializing Servos...")
@@ -2704,7 +2748,7 @@ def test_rwm_real_robot_wm(model_path):
                     if detector_latent is None:
                         detector_latent = rwm_inference.wm_latent
                     if detector_latent is not None:
-                        detector_last_anomaly, detector_last_error, detector_latent = contact_detector.detect(
+                        detector_last_anomaly, detector_last_error, detector_latent, detector_last_steps = contact_detector.detect(
                             prev_latent=detector_latent,
                             action=action_nominal,
                             obs_dict=obs_dict,
@@ -2712,7 +2756,10 @@ def test_rwm_real_robot_wm(model_path):
                         actions = adjust_action(
                             actions,
                             detector_last_anomaly,
-                            scale=CONTACT_ANOMALY_ACTION_SCALE,
+                            detector_last_steps,
+                            base_scale=CONTACT_ANOMALY_ACTION_SCALE,
+                            lift_gain=CONTACT_ANOMALY_LIFT_GAIN,
+                            max_lift_gain=CONTACT_ANOMALY_MAX_LIFT_GAIN,
                         )
                 #print("actions: ", actions)
 

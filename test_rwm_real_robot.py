@@ -70,12 +70,12 @@ MAX_STEPS = 2000
 # [0:3] l1_bc,l1_cf,l1_ft  [3:6] l2  [6:9] l3  [9:12] r1  [12:15] r2  [15:18] r3
 ACTION_SCALE_PER_DIM = np.array(
     [
-        0.40, 0.40, 0.40,  # l1
-        0.40, 0.40, 0.40,  # l2
-        0.40, 0.40, 0.40,  # l3
-        0.40, 0.40, 0.40,  # r1
-        0.40, 0.40, 0.40,  # r2
-        0.40, 0.40, 0.40,  # r3
+        0.50, 0.50, 0.50,  # l1
+        0.50, 0.50, 0.50,  # l2
+        0.50, 0.50, 0.50,  # l3
+        0.50, 0.50, 0.50,  # r1
+        0.50, 0.50, 0.50,  # r2
+        0.50, 0.50, 0.50,  # r3
     ],
     dtype=np.float32,
 )
@@ -1933,9 +1933,9 @@ def test_rwm_real_robot(model_path):
 
     # Admittance controller to smooth actions
     admittance_filter = AdmittanceFilter(
-        m=0.5,#0.1
-        d=15.0,#10
-        k=80.0,#80
+        m=0.3,#0.5,#0.1
+        d=10.0,#15.0,#10
+        k=100.0,#80.0,#80
         dt=TARGET_DT,
         num_joints=18
     )
