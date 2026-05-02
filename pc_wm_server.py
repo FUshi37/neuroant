@@ -17,6 +17,10 @@ if os.name == "nt":
         print("[PC] cl.exe not found, forcing eager mode (DISABLE_TORCH_COMPILE=1)")
 
 from test_rwm_real_robot_wm import (
+    CONTACT_ANOMALY_EMA_ALPHA,
+    CONTACT_ANOMALY_THRESHOLD,
+    CONTACT_ANOMALY_TRIGGER_COUNT,
+    ContactAnomalyDetector,
     ImaginationStabilityFilter,
     RealRobotRWMInference,
     get_action_limits,
@@ -35,6 +39,7 @@ def run_server(
     log_every=50,
     use_stability_filter=False,
     filter_debug_path=None,
+    log_contact_anomaly=True,
 ):
     print(f"[PC] starting WM server at {host}:{port}")
     inference = RealRobotRWMInference(model_path, device="cpu", remove_dof_vel=remove_dof_vel)
@@ -51,6 +56,19 @@ def run_server(
         if (use_stability_filter and inference.world_model is not None)
         else None
     )
+    contact_detector = (
+        ContactAnomalyDetector(
+            world_model=inference.world_model,
+            threshold=CONTACT_ANOMALY_THRESHOLD,
+            ema_alpha=CONTACT_ANOMALY_EMA_ALPHA,
+            trigger_count=CONTACT_ANOMALY_TRIGGER_COUNT,
+            action_dim=18,
+            device="cpu",
+        )
+        if (log_contact_anomaly and inference.world_model is not None)
+        else None
+    )
+    detector_latent = inference.wm_latent
     action_limits = get_action_limits()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -96,6 +114,7 @@ def run_server(
 
             t0 = time.perf_counter()
             filter_debug = {"used": False, "error": ""}
+            anomaly_debug = {"enabled": False, "is_anomaly": False, "error": "", "steps": 0}
             try:
                 msg = json.loads(data.decode("utf-8"))
                 if msg.get("type") != "obs":
@@ -114,6 +133,30 @@ def run_server(
                 with torch.no_grad():
                     wm_feature = inference.update_world_model(obs_dict, prev_action)
                     actions = policy(obs_dict["prop"], history_t, wm_feature)
+                    if contact_detector is not None:
+                        if detector_latent is None:
+                            detector_latent = inference.wm_latent
+                        if detector_latent is not None:
+                            try:
+                                is_anomaly, ema_error, detector_latent, anomaly_steps = contact_detector.detect(
+                                    prev_latent=detector_latent,
+                                    action=actions,
+                                    obs_dict=obs_dict,
+                                )
+                                anomaly_debug = {
+                                    "enabled": True,
+                                    "is_anomaly": bool(is_anomaly),
+                                    "error": float(torch.max(ema_error).detach().cpu().item()),
+                                    "steps": int(anomaly_steps),
+                                }
+                            except Exception as e:
+                                anomaly_debug = {
+                                    "enabled": True,
+                                    "is_anomaly": False,
+                                    "error": f"detect_error:{e}",
+                                    "steps": 0,
+                                }
+                                print(f"[PC] contact anomaly detector error: {e}")
                     if stability_filter is not None and inference.wm_latent is not None:
                         try:
                             prev_action_t = (
@@ -173,7 +216,11 @@ def run_server(
                         f"from={addr[0]}:{addr[1]} step={step} "
                         f"act[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
                         f"server={server_ms:.2f}ms "
-                        f"filter_used={row['filter_used']} improve={row['improvement']} delta={row['delta']}"
+                        f"filter_used={row['filter_used']} improve={row['improvement']} delta={row['delta']} "
+                        f"contact_enabled={int(anomaly_debug['enabled'])} "
+                        f"contact_anomaly={int(anomaly_debug['is_anomaly'])} "
+                        f"contact_error={anomaly_debug['error']} "
+                        f"contact_steps={anomaly_debug['steps']}"
                     )
             except Exception as e:
                 resp = {
@@ -200,6 +247,7 @@ def main():
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--use-stability-filter", action="store_true")
     parser.add_argument("--filter-debug-path", default=None)
+    parser.add_argument("--no-contact-anomaly-log", action="store_true")
     args = parser.parse_args()
     run_server(
         args.host,
@@ -209,6 +257,7 @@ def main():
         log_every=args.log_every,
         use_stability_filter=args.use_stability_filter,
         filter_debug_path=args.filter_debug_path,
+        log_contact_anomaly=not args.no_contact_anomaly_log,
     )
 
 
