@@ -2955,9 +2955,19 @@ def test_rwm_real_robot_wm(model_path):
                     servo_ms = (servo_end_pc - servo_start_pc) * 1000.0
                     work_ms = (work_end_pc - loop_start_pc) * 1000.0
                     total_ms = final_elapsed * 1000.0
+                    if detector_last_error is None:
+                        contact_error_log = "NA"
+                    elif torch.is_tensor(detector_last_error):
+                        contact_error_log = f"{float(torch.max(detector_last_error).detach().cpu().item()):.4f}"
+                    else:
+                        contact_error_log = f"{float(detector_last_error):.4f}"
                     print(
                         f"[Timing] step={step} sensor={sensor_ms:.1f}ms wm={wm_ms:.1f}ms "
-                        f"policy={policy_ms:.1f}ms servo={servo_ms:.1f}ms work={work_ms:.1f}ms total={total_ms:.1f}ms"
+                        f"policy={policy_ms:.1f}ms servo={servo_ms:.1f}ms work={work_ms:.1f}ms total={total_ms:.1f}ms "
+                        f"contact_enabled={int(contact_detector is not None)} "
+                        f"contact_anomaly={int(bool(detector_last_anomaly))} "
+                        f"contact_error={contact_error_log} "
+                        f"contact_steps={int(detector_last_steps)}"
                     )
 
                 step += 1
