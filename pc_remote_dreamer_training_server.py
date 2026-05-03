@@ -10,6 +10,7 @@ then the Pi sends reset_done so this process clears RSSM latent state.
 
 import argparse
 import json
+import os
 import socket
 import time
 from typing import Dict, Optional, Tuple
@@ -200,6 +201,13 @@ class WorldModelActionAdapter(nn.Module):
 def _make_real_components(args) -> Tuple[nn.Module, nn.Module, torch.device]:
     if not args.model_path:
         raise ValueError("Please provide --model-path for real mode.")
+
+    if args.disable_torch_compile:
+        # Remote real-robot training should prioritize predictable latency and
+        # memory usage.  The deployment helper compiles WM/policy by default,
+        # which can trigger CUDA allocations even when the model is loaded on
+        # CPU, so disable it unless explicitly requested.
+        os.environ["DISABLE_TORCH_COMPILE"] = "1"
 
     from test_rwm_real_robot_wm import RealRobotRWMInference
 
@@ -476,6 +484,12 @@ def parse_args():
     parser.add_argument("--dry-run", action="store_true", help="Use small dummy trainable modules.")
     parser.add_argument("--model-path", default=None, help="Checkpoint path used by your _make_real_components().")
     parser.add_argument("--remove-dof-vel", action="store_true", help="Match checkpoints trained without joint velocity.")
+    parser.add_argument(
+        "--disable-torch-compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Disable torch.compile in the imported deployment helper.",
+    )
     parser.add_argument("--train-every-steps", type=int, default=5)
     parser.add_argument("--imagination-horizon", type=int, default=5)
     parser.add_argument("--policy-lr", type=float, default=3e-4)
