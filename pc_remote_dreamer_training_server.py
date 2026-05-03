@@ -35,23 +35,199 @@ def _float_list(x) -> list:
     return [float(v) for v in np.asarray(x, dtype=np.float32).reshape(-1)]
 
 
-def _make_real_components(args) -> Tuple[nn.Module, nn.Module]:
-    """
-    Replace this function with your real trainable policy and world model.
+class TrainableRWMPolicy(nn.Module):
+    """Wrap ActorCriticRWM with the API used by the remote training loop."""
 
-    Required APIs:
-      policy(obs_prop, history, wm_feature) -> [B, 18]
-      policy.actor(feat) -> [B, 18] for short imagination
-      world_model.encoder(obs_dict)
-      world_model.dynamics.obs_step(prev_latent, action, embed, is_first, sample=True)
-      world_model.dynamics.img_step(latent, action, sample=True)
-      world_model.dynamics.get_feat(latent)
-      world_model.heads["decoder"](feat)
-    """
-    raise NotImplementedError(
-        "Real trainable components are not wired yet. Start with --dry-run, "
-        "then edit _make_real_components() to load your policy/world_model checkpoint."
+    def __init__(self, actor_critic: nn.Module, history_dim: int, wm_feature_dim: int):
+        super().__init__()
+        self.actor_critic = actor_critic
+        self.history_dim = int(history_dim)
+        self.wm_feature_dim = int(wm_feature_dim)
+
+    def _adapt_history(self, history: Optional[torch.Tensor], batch: int, device) -> torch.Tensor:
+        if history is None:
+            return torch.zeros(batch, self.history_dim, device=device)
+        history = ensure_batch(history).to(device=device, dtype=torch.float32)
+        if history.shape[-1] == self.history_dim:
+            return history
+        if history.shape[-1] > self.history_dim:
+            return history[..., -self.history_dim :]
+        pad = torch.zeros(batch, self.history_dim - history.shape[-1], device=device)
+        return torch.cat([pad, history], dim=-1)
+
+    def _adapt_wm_feature(self, wm_feature: torch.Tensor) -> torch.Tensor:
+        wm_feature = ensure_batch(wm_feature)
+        if wm_feature.shape[-1] == self.wm_feature_dim:
+            return wm_feature
+        if wm_feature.shape[-1] > self.wm_feature_dim:
+            # RSSM.get_feat() is [stoch, deter]; deployed policy usually expects deter only.
+            return wm_feature[..., -self.wm_feature_dim :]
+        pad = torch.zeros(
+            *wm_feature.shape[:-1],
+            self.wm_feature_dim - wm_feature.shape[-1],
+            device=wm_feature.device,
+            dtype=wm_feature.dtype,
+        )
+        return torch.cat([wm_feature, pad], dim=-1)
+
+    def forward(
+        self,
+        obs_prop: torch.Tensor,
+        history: Optional[torch.Tensor],
+        wm_feature: torch.Tensor,
+    ) -> torch.Tensor:
+        obs_prop = ensure_batch(obs_prop)
+        batch = obs_prop.shape[0]
+        history = self._adapt_history(history, batch, obs_prop.device)
+        wm_feature = self._adapt_wm_feature(wm_feature)
+        latent_vector = self.actor_critic.history_encoder(history)
+        command = obs_prop[:, 6:9]
+        wm_latent = self.actor_critic.wm_feature_encoder(wm_feature)
+        actor_in = torch.cat([latent_vector, command, wm_latent], dim=-1)
+        return self.actor_critic.actor(actor_in)
+
+    def actor(self, wm_feature: torch.Tensor) -> torch.Tensor:
+        """Action head used during imagination when no real history is available."""
+        wm_feature = self._adapt_wm_feature(wm_feature)
+        batch = wm_feature.shape[0]
+        latent_dim = int(self.actor_critic.history_encoder[-1].out_features)
+        latent_vector = torch.zeros(batch, latent_dim, device=wm_feature.device, dtype=wm_feature.dtype)
+        command = torch.zeros(batch, 3, device=wm_feature.device, dtype=wm_feature.dtype)
+        wm_latent = self.actor_critic.wm_feature_encoder(wm_feature)
+        actor_in = torch.cat([latent_vector, command, wm_latent], dim=-1)
+        return self.actor_critic.actor(actor_in)
+
+
+class ActionHistoryDynamicsAdapter(nn.Module):
+    """Let a RSSM trained with action history accept a live 18-dim action."""
+
+    HISTORY_KEY = "_action_history"
+
+    def __init__(self, dynamics: nn.Module, action_dim: int = ACTION_DIM):
+        super().__init__()
+        self.dynamics = dynamics
+        self.action_dim = int(action_dim)
+        self.rssm_action_dim = int(getattr(dynamics, "_num_actions", action_dim))
+        if self.rssm_action_dim % self.action_dim != 0:
+            raise ValueError(
+                f"RSSM action dim {self.rssm_action_dim} is not a multiple of {self.action_dim}"
+            )
+        self.history_len = self.rssm_action_dim // self.action_dim
+
+    def _strip_history(self, latent):
+        if isinstance(latent, dict) and self.HISTORY_KEY in latent:
+            return {k: v for k, v in latent.items() if k != self.HISTORY_KEY}
+        return latent
+
+    def _history_from_latent(self, latent, action: torch.Tensor) -> torch.Tensor:
+        batch = action.shape[0]
+        if isinstance(latent, dict) and self.HISTORY_KEY in latent:
+            return latent[self.HISTORY_KEY]
+        return torch.zeros(
+            batch,
+            self.history_len,
+            self.action_dim,
+            device=action.device,
+            dtype=action.dtype,
+        )
+
+    def _reset_history_where_first(self, history: torch.Tensor, is_first: torch.Tensor) -> torch.Tensor:
+        if is_first is None:
+            return history
+        is_first = is_first.reshape(history.shape[0], 1, 1).to(device=history.device, dtype=history.dtype)
+        return history * (1.0 - is_first)
+
+    def _append_action(self, history: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        new_history = torch.cat([history[:, 1:], action[:, None, :]], dim=1)
+        return new_history.reshape(action.shape[0], -1), new_history
+
+    def _rssm_action_and_history(self, latent, action: torch.Tensor, is_first=None) -> Tuple[torch.Tensor, torch.Tensor]:
+        action = ensure_batch(action)
+        if action.shape[-1] == self.rssm_action_dim:
+            history = action.reshape(action.shape[0], self.history_len, self.action_dim)
+            history = self._reset_history_where_first(history, is_first)
+            return history.reshape(action.shape[0], -1), history
+        if action.shape[-1] == self.action_dim:
+            history = self._history_from_latent(latent, action)
+            history = self._reset_history_where_first(history, is_first)
+            return self._append_action(history, action)
+        raise ValueError(
+            f"Cannot map action dim {action.shape[-1]} to RSSM action dim {self.rssm_action_dim}"
+        )
+
+    def obs_step(self, prev_latent, action, embed, is_first, sample=True):
+        rssm_action, new_history = self._rssm_action_and_history(prev_latent, action, is_first)
+        post, prior = self.dynamics.obs_step(
+            self._strip_history(prev_latent),
+            rssm_action,
+            embed,
+            is_first,
+            sample,
+        )
+        post[self.HISTORY_KEY] = new_history
+        prior[self.HISTORY_KEY] = new_history
+        return post, prior
+
+    def img_step(self, latent, action, sample=True):
+        rssm_action, new_history = self._rssm_action_and_history(latent, action)
+        prior = self.dynamics.img_step(self._strip_history(latent), rssm_action, sample)
+        prior[self.HISTORY_KEY] = new_history
+        return prior
+
+    def get_feat(self, latent):
+        return self.dynamics.get_feat(latent)
+
+    def get_deter_feat(self, latent):
+        return self.dynamics.get_deter_feat(latent)
+
+    def initial(self, *args, **kwargs):
+        return self.dynamics.initial(*args, **kwargs)
+
+
+class WorldModelActionAdapter(nn.Module):
+    """World model proxy with action-dim adaptation for obs_step/img_step."""
+
+    def __init__(self, world_model: nn.Module):
+        super().__init__()
+        self.world_model = world_model
+        self.dynamics = ActionHistoryDynamicsAdapter(world_model.dynamics)
+        self.heads = world_model.heads
+
+    def encoder(self, obs_dict):
+        return self.world_model.encoder(obs_dict)
+
+
+def _make_real_components(args) -> Tuple[nn.Module, nn.Module]:
+    if not args.model_path:
+        raise ValueError("Please provide --model-path for real mode.")
+
+    from test_rwm_real_robot_wm import RealRobotRWMInference
+
+    inference = RealRobotRWMInference(
+        args.model_path,
+        device=args.device,
+        remove_dof_vel=args.remove_dof_vel,
     )
+    if not getattr(inference, "model_loaded", False):
+        raise RuntimeError(f"Failed to load checkpoint: {args.model_path}")
+    if getattr(inference, "world_model", None) is None:
+        raise RuntimeError("Checkpoint did not contain a usable world_model_dict.")
+
+    actor_critic = inference.actor_critic
+    actor_critic.train()
+    policy = TrainableRWMPolicy(
+        actor_critic=actor_critic,
+        history_dim=int(inference.history_dim),
+        wm_feature_dim=int(inference.wm_feature_dim),
+    )
+    world_model = WorldModelActionAdapter(inference.world_model)
+    world_model.eval()
+    print(
+        "[PC] loaded real checkpoint: "
+        f"history_dim={inference.history_dim}, wm_feature_dim={inference.wm_feature_dim}, "
+        f"rssm_action_dim={world_model.dynamics.rssm_action_dim}"
+    )
+    return policy, world_model
 
 
 class PCRemoteDreamerServer:
@@ -187,7 +363,9 @@ class PCRemoteDreamerServer:
             self.prev_latent, latent_prior, loss = train_step(
                 obs_dict=obs_dict,
                 prev_latent=self.prev_latent,
-                action_real=action.detach(),
+                # The current observation was caused by the previous action.
+                # This matches RealRobotRWMInference.update_world_model().
+                action_real=self.prev_action.detach(),
                 prev_action=self.prev_action,
                 policy=self.policy,
                 world_model=self.world_model,
@@ -201,7 +379,7 @@ class PCRemoteDreamerServer:
                 embed = self.world_model.encoder(obs_dict)
                 self.prev_latent, latent_prior = self.world_model.dynamics.obs_step(
                     self.prev_latent,
-                    action.detach(),
+                        self.prev_action.detach(),
                     embed,
                     obs_dict["is_first"],
                     sample=True,
@@ -254,6 +432,7 @@ def parse_args():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dry-run", action="store_true", help="Use small dummy trainable modules.")
     parser.add_argument("--model-path", default=None, help="Checkpoint path used by your _make_real_components().")
+    parser.add_argument("--remove-dof-vel", action="store_true", help="Match checkpoints trained without joint velocity.")
     parser.add_argument("--train-every-steps", type=int, default=5)
     parser.add_argument("--imagination-horizon", type=int, default=5)
     parser.add_argument("--policy-lr", type=float, default=3e-4)

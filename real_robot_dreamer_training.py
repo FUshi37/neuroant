@@ -519,7 +519,9 @@ class RealRobotDreamerTrainer:
                 self.prev_latent, latent_prior, loss = train_step(
                     obs_dict=obs_dict,
                     prev_latent=self.prev_latent,
-                    action_real=action.detach(),
+                    # obs_t is the result of action_{t-1}; action_t has only
+                    # just been sent and must not be used to update this obs.
+                    action_real=self.prev_action.detach(),
                     prev_action=self.prev_action,
                     policy=self.policy,
                     world_model=self.world_model,
@@ -534,7 +536,7 @@ class RealRobotDreamerTrainer:
                     embed = self.world_model.encoder(obs_dict)
                     self.prev_latent, latent_prior = self.world_model.dynamics.obs_step(
                         self.prev_latent,
-                        action.detach(),
+                        self.prev_action.detach(),
                         embed,
                         obs_dict["is_first"],
                         sample=True,
