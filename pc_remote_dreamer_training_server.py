@@ -197,15 +197,18 @@ class WorldModelActionAdapter(nn.Module):
         return self.world_model.encoder(obs_dict)
 
 
-def _make_real_components(args) -> Tuple[nn.Module, nn.Module]:
+def _make_real_components(args) -> Tuple[nn.Module, nn.Module, torch.device]:
     if not args.model_path:
         raise ValueError("Please provide --model-path for real mode.")
 
     from test_rwm_real_robot_wm import RealRobotRWMInference
 
+    # Load checkpoints on CPU first.  Loading directly with map_location="cuda"
+    # can double-spike VRAM and fail before we can choose which modules actually
+    # need to run on GPU.
     inference = RealRobotRWMInference(
         args.model_path,
-        device=args.device,
+        device=args.load_device,
         remove_dof_vel=args.remove_dof_vel,
     )
     if not getattr(inference, "model_loaded", False):
@@ -222,12 +225,48 @@ def _make_real_components(args) -> Tuple[nn.Module, nn.Module]:
     )
     world_model = WorldModelActionAdapter(inference.world_model)
     world_model.eval()
+
+    runtime_device = torch.device(args.device)
+    if runtime_device.type == "cuda":
+        try:
+            policy = policy.to(runtime_device)
+            world_model = world_model.to(runtime_device)
+            torch.cuda.empty_cache()
+            print(f"[PC] moved policy/world_model to {runtime_device}")
+        except torch.cuda.OutOfMemoryError as exc:
+            print(f"[PC] CUDA OOM while moving model to {runtime_device}: {exc}")
+            print("[PC] falling back to CPU. Use --device cpu explicitly if this is expected.")
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            runtime_device = torch.device("cpu")
+            policy = policy.to(runtime_device)
+            world_model = world_model.to(runtime_device)
+            args.device = "cpu"
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            print(f"[PC] CUDA OOM while moving model to {runtime_device}: {exc}")
+            print("[PC] falling back to CPU. Use --device cpu explicitly if this is expected.")
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            runtime_device = torch.device("cpu")
+            policy = policy.to(runtime_device)
+            world_model = world_model.to(runtime_device)
+            args.device = "cpu"
+    else:
+        policy = policy.to(runtime_device)
+        world_model = world_model.to(runtime_device)
+
     print(
         "[PC] loaded real checkpoint: "
         f"history_dim={inference.history_dim}, wm_feature_dim={inference.wm_feature_dim}, "
-        f"rssm_action_dim={world_model.dynamics.rssm_action_dim}"
+        f"rssm_action_dim={world_model.dynamics.rssm_action_dim}, runtime_device={runtime_device}"
     )
-    return policy, world_model
+    return policy, world_model, runtime_device
 
 
 class PCRemoteDreamerServer:
@@ -248,9 +287,8 @@ class PCRemoteDreamerServer:
             self.world_model = DummyWorldModel(feat_dim=64).to(self.device)
             print("[PC] dry-run trainable policy/world_model loaded")
         else:
-            self.policy, self.world_model = _make_real_components(args)
-            self.policy = self.policy.to(self.device)
-            self.world_model = self.world_model.to(self.device)
+            self.policy, self.world_model, self.device = _make_real_components(args)
+            self.cfg.device = str(self.device)
 
         for p in self.world_model.parameters():
             p.requires_grad_(False)
@@ -430,6 +468,11 @@ def parse_args():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=9876)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--load-device",
+        default="cpu",
+        help="Device used only for checkpoint loading. Keep this as cpu to avoid CUDA OOM.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Use small dummy trainable modules.")
     parser.add_argument("--model-path", default=None, help="Checkpoint path used by your _make_real_components().")
     parser.add_argument("--remove-dof-vel", action="store_true", help="Match checkpoints trained without joint velocity.")
