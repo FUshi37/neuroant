@@ -314,6 +314,7 @@ class PCRemoteDreamerServer:
         self.reset_pending = False
         self.step_count = 0
         self.last_loss = None
+        self.train_enabled = bool(args.online_train)
 
         self.zero_wm_feature = self._make_zero_wm_feature()
 
@@ -404,8 +405,14 @@ class PCRemoteDreamerServer:
         )
 
         latent_prior = None
-        should_train = self.step_count % max(1, self.args.train_every_steps) == 0
+        should_train = (
+            self.train_enabled
+            and self.step_count >= int(self.args.train_start_steps)
+            and self.step_count % max(1, self.args.train_every_steps) == 0
+        )
+        train_ms = 0.0
         if should_train:
+            train_t0 = time.perf_counter()
             self.prev_latent, latent_prior, loss = train_step(
                 obs_dict=obs_dict,
                 prev_latent=self.prev_latent,
@@ -420,6 +427,7 @@ class PCRemoteDreamerServer:
                 global_step=self.step_count,
             )
             self.last_loss = loss
+            train_ms = float((time.perf_counter() - train_t0) * 1000.0)
         else:
             with torch.no_grad():
                 embed = self.world_model.encoder(obs_dict)
@@ -443,7 +451,10 @@ class PCRemoteDreamerServer:
         if self.step_count <= 5 or self.step_count % max(1, self.args.log_every) == 0:
             print(
                 f"[PC] step={step} train={int(should_train)} "
-                f"loss={self.last_loss} action_mean={float(action.mean().detach().cpu()):.4f}"
+                f"loss={self.last_loss} train_ms={train_ms:.1f} "
+                f"action[min={float(action.min().detach().cpu()):.4f}, "
+                f"max={float(action.max().detach().cpu()):.4f}, "
+                f"mean={float(action.mean().detach().cpu()):.4f}]"
             )
 
     def serve_forever(self) -> None:
@@ -491,6 +502,18 @@ def parse_args():
         help="Disable torch.compile in the imported deployment helper.",
     )
     parser.add_argument("--train-every-steps", type=int, default=5)
+    parser.add_argument(
+        "--online-train",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable gradient updates in the UDP control server. Default off for real-time safety.",
+    )
+    parser.add_argument(
+        "--train-start-steps",
+        type=int,
+        default=500,
+        help="Delay online gradient updates until control/network are stable.",
+    )
     parser.add_argument("--imagination-horizon", type=int, default=5)
     parser.add_argument("--policy-lr", type=float, default=3e-4)
     parser.add_argument("--grad-clip", type=float, default=10.0)
