@@ -199,6 +199,33 @@ class WorldModelActionAdapter(nn.Module):
         return self.world_model.encoder(obs_dict)
 
 
+def _set_runtime_device_attrs(module: nn.Module, device: torch.device) -> None:
+    """
+    Some world_model classes cache a device string in plain attributes such as
+    `self.device` / `self._device`.  `module.to(cuda)` moves parameters and
+    buffers, but it does not update those attributes, so RSSM.initial(),
+    obs_step(), img_step() may still create CPU tensors and later fail at cat().
+    """
+    device_str = str(device)
+    for submodule in module.modules():
+        if hasattr(submodule, "device"):
+            try:
+                submodule.device = device
+            except Exception:
+                pass
+        if hasattr(submodule, "_device"):
+            try:
+                submodule._device = device
+            except Exception:
+                pass
+        cfg = getattr(submodule, "_config", None)
+        if cfg is not None and hasattr(cfg, "device"):
+            try:
+                cfg.device = device_str
+            except Exception:
+                pass
+
+
 def _make_real_components(args) -> Tuple[nn.Module, nn.Module, torch.device]:
     if not args.model_path:
         raise ValueError("Please provide --model-path for real mode.")
@@ -240,6 +267,7 @@ def _make_real_components(args) -> Tuple[nn.Module, nn.Module, torch.device]:
         try:
             policy = policy.to(runtime_device)
             world_model = world_model.to(runtime_device)
+            _set_runtime_device_attrs(world_model, runtime_device)
             torch.cuda.empty_cache()
             print(f"[PC] moved policy/world_model to {runtime_device}")
         except torch.cuda.OutOfMemoryError as exc:
@@ -252,6 +280,7 @@ def _make_real_components(args) -> Tuple[nn.Module, nn.Module, torch.device]:
             runtime_device = torch.device("cpu")
             policy = policy.to(runtime_device)
             world_model = world_model.to(runtime_device)
+            _set_runtime_device_attrs(world_model, runtime_device)
             args.device = "cpu"
         except RuntimeError as exc:
             if "out of memory" not in str(exc).lower():
@@ -265,10 +294,12 @@ def _make_real_components(args) -> Tuple[nn.Module, nn.Module, torch.device]:
             runtime_device = torch.device("cpu")
             policy = policy.to(runtime_device)
             world_model = world_model.to(runtime_device)
+            _set_runtime_device_attrs(world_model, runtime_device)
             args.device = "cpu"
     else:
         policy = policy.to(runtime_device)
         world_model = world_model.to(runtime_device)
+        _set_runtime_device_attrs(world_model, runtime_device)
 
     print(
         "[PC] loaded real checkpoint: "
