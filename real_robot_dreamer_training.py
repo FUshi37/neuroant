@@ -35,8 +35,8 @@ class TrainConfig:
     grad_clip: float = 10.0
     max_steps: int = 0
     dry_run: bool = True
-    battery_voltage_threshold: float = 11.9
-    battery_max_steps: int = 20000
+    battery_voltage_threshold: float = 11.0
+    battery_max_steps: int = 5000
 
 
 class RobotIO(Protocol):
@@ -268,6 +268,16 @@ def compute_reward(
     prev_action: torch.Tensor,
     cpg_target: torch.Tensor,
 ) -> torch.Tensor:
+    return compute_reward_components(obs, action, prev_action, cpg_target)["total"]
+
+
+def compute_reward_components(
+    obs: torch.Tensor,
+    action: torch.Tensor,
+    prev_action: torch.Tensor,
+    cpg_target: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Return weighted reward terms for debugging real-robot behavior."""
     obs = ensure_batch(obs)
     action = ensure_batch(action)
     prev_action = ensure_batch(prev_action)
@@ -288,7 +298,22 @@ def compute_reward(
     r_cpg = -torch.mean((joint_pos - cpg_target) ** 2, dim=-1)
     r_smooth = -torch.mean((action - prev_action) ** 2, dim=-1)
     r_action = -torch.mean(action**2, dim=-1)
-    return 2.0 * r_upright + 0.05 * r_ang + 0.5 * r_cpg + 0.2 * r_smooth + 0.05 * r_action
+    components = {
+        "upright": 2.0 * r_upright,
+        "ang_vel": 0.05 * r_ang,
+        "cpg": 0.5 * r_cpg,
+        "smooth": 0.2 * r_smooth,
+        "action_l2": 0.05 * r_action,
+    }
+    components["total"] = sum(components.values())
+    return components
+
+
+def detach_reward_metrics(prefix: str, components: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    return {
+        f"{prefix}_{name}": float(value.detach().mean().cpu())
+        for name, value in components.items()
+    }
 
 
 def get_cpg_targets(horizon: int, device: torch.device, step: int = 0) -> torch.Tensor:
@@ -403,13 +428,14 @@ def imagination_rollout(
     horizon: int,
     cpg_targets: torch.Tensor,
     prev_action: torch.Tensor,
-) -> List[torch.Tensor]:
+) -> Tuple[List[torch.Tensor], Dict[str, torch.Tensor]]:
     """
     Short imagination only.  On a real robot, long imagination quickly compounds
     model error and can push the policy toward unsafe actions.
     """
     horizon = min(int(horizon), MAX_IMAGINATION_HORIZON)
     rewards: List[torch.Tensor] = []
+    component_history: Dict[str, List[torch.Tensor]] = {}
     action_prev = ensure_batch(prev_action)
 
     for t in range(horizon):
@@ -420,11 +446,18 @@ def imagination_rollout(
         pred = world_model.heads["decoder"](feat_next)
         obs_pred = decoder_mean(pred)
 
-        reward = compute_reward(obs_pred, action, action_prev, cpg_targets[t])
+        components = compute_reward_components(obs_pred, action, action_prev, cpg_targets[t])
+        reward = components["total"]
         rewards.append(reward)
+        for name, value in components.items():
+            component_history.setdefault(name, []).append(value)
         action_prev = action
 
-    return rewards
+    component_means = {
+        name: torch.stack(values).mean()
+        for name, values in component_history.items()
+    }
+    return rewards, component_means
 
 
 def estimate_anomaly(
@@ -454,7 +487,7 @@ def train_step(
     optimizer: torch.optim.Optimizer,
     cfg: TrainConfig,
     global_step: int,
-) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], float]:
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], float, Dict[str, float]]:
     """
     One low-frequency policy update.
 
@@ -487,9 +520,10 @@ def train_step(
 
     feat = world_model.dynamics.get_feat(latent_post)
     action_now = soft_action_limit(policy(obs, None, feat.detach()), cfg.action_limit)
-    real_reward = compute_reward(obs, action_now, prev_action, cpg_targets[0])
+    real_components = compute_reward_components(obs, action_now, prev_action, cpg_targets[0])
+    real_reward = real_components["total"]
 
-    imag_rewards = imagination_rollout(
+    imag_rewards, imag_components = imagination_rollout(
         world_model,
         policy,
         latent_post,
@@ -505,7 +539,10 @@ def train_step(
     torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.grad_clip)
     optimizer.step()
 
-    return latent_post, latent_prior, float(loss.detach().cpu())
+    metrics = {"loss": float(loss.detach().cpu())}
+    metrics.update(detach_reward_metrics("real", real_components))
+    metrics.update(detach_reward_metrics("imag", imag_components))
+    return latent_post, latent_prior, float(loss.detach().cpu()), metrics
 
 
 class RealRobotDreamerTrainer:
@@ -608,7 +645,7 @@ class RealRobotDreamerTrainer:
             should_train = self.global_step % max(1, self.cfg.train_every_steps) == 0
             latent_prior = None
             if should_train:
-                self.prev_latent, latent_prior, loss = train_step(
+                self.prev_latent, latent_prior, loss, reward_metrics = train_step(
                     obs_dict=obs_dict,
                     prev_latent=self.prev_latent,
                     # obs_t is the result of action_{t-1}; action_t has only
@@ -622,7 +659,15 @@ class RealRobotDreamerTrainer:
                     global_step=self.global_step,
                 )
                 if self.global_step % 50 == 0:
-                    print(f"step={self.global_step} loss={loss:.4f}")
+                    print(
+                        f"step={self.global_step} loss={loss:.4f} "
+                        f"real_total={reward_metrics['real_total']:.4f} "
+                        f"imag_total={reward_metrics['imag_total']:.4f} "
+                        f"upright={reward_metrics['real_upright']:.4f} "
+                        f"cpg={reward_metrics['real_cpg']:.4f} "
+                        f"smooth={reward_metrics['real_smooth']:.4f} "
+                        f"action_l2={reward_metrics['real_action_l2']:.4f}"
+                    )
             else:
                 with torch.no_grad():
                     embed = self.world_model.encoder(obs_dict)

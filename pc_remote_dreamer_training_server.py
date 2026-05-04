@@ -352,6 +352,7 @@ class PCRemoteDreamerServer:
         self.run_id = 0
         self.step_count = 0
         self.last_loss = None
+        self.last_reward_metrics = {}
         self.train_enabled = bool(args.online_train)
 
         self.zero_wm_feature = self._make_zero_wm_feature()
@@ -491,6 +492,7 @@ class PCRemoteDreamerServer:
                 "server_ms": float((time.perf_counter() - t0) * 1000.0),
                 "is_first": bool(self.need_first),
                 "last_loss": self.last_loss,
+                "reward_metrics": self.last_reward_metrics,
             },
         )
 
@@ -503,7 +505,7 @@ class PCRemoteDreamerServer:
         train_ms = 0.0
         if should_train:
             train_t0 = time.perf_counter()
-            self.prev_latent, latent_prior, loss = train_step(
+            self.prev_latent, latent_prior, loss, reward_metrics = train_step(
                 obs_dict=obs_dict,
                 prev_latent=self.prev_latent,
                 # The current observation was caused by the previous action.
@@ -517,6 +519,7 @@ class PCRemoteDreamerServer:
                 global_step=self.step_count,
             )
             self.last_loss = loss
+            self.last_reward_metrics = reward_metrics
             train_ms = float((time.perf_counter() - train_t0) * 1000.0)
         else:
             with torch.no_grad():
@@ -540,6 +543,18 @@ class PCRemoteDreamerServer:
         self.battery_manager.step()
 
         if self.step_count <= 5 or self.step_count % max(1, self.args.log_every) == 0:
+            rm = self.last_reward_metrics
+            reward_text = ""
+            if rm:
+                reward_text = (
+                    f" reward[real_total={rm.get('real_total', 0.0):.4f}, "
+                    f"upright={rm.get('real_upright', 0.0):.4f}, "
+                    f"ang={rm.get('real_ang_vel', 0.0):.4f}, "
+                    f"cpg={rm.get('real_cpg', 0.0):.4f}, "
+                    f"smooth={rm.get('real_smooth', 0.0):.4f}, "
+                    f"act={rm.get('real_action_l2', 0.0):.4f}, "
+                    f"imag_total={rm.get('imag_total', 0.0):.4f}]"
+                )
             print(
                 f"[PC] step={step} train={int(should_train)} "
                 f"loss={self.last_loss} train_ms={train_ms:.1f} "
@@ -547,6 +562,7 @@ class PCRemoteDreamerServer:
                 f"action[min={float(action.min().detach().cpu()):.4f}, "
                 f"max={float(action.max().detach().cpu()):.4f}, "
                 f"mean={float(action.mean().detach().cpu()):.4f}]"
+                f"{reward_text}"
             )
 
     def serve_forever(self) -> None:
