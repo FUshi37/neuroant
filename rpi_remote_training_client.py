@@ -118,6 +118,19 @@ def _read_voltage_safe(servos, last_voltage=None):
         return last_voltage
 
 
+def _extract_yaw_from_imu(imu_data):
+    try:
+        if imu_data is None:
+            return None
+        arr = np.asarray(imu_data, dtype=np.float32).reshape(-1)
+        if arr.shape[0] < 3:
+            return None
+        # JY901 callback returns [roll, pitch, yaw, gyroX, ...] in degrees.
+        return float(arr[2])
+    except Exception:
+        return None
+
+
 def run_client(server_ip, server_port, timeout_s, max_steps, log_every, voltage_check_every):
     if HARDWARE_IMPORT_ERROR is not None:
         raise RuntimeError(f"hardware import failed: {HARDWARE_IMPORT_ERROR}")
@@ -169,6 +182,7 @@ def run_client(server_ip, server_port, timeout_s, max_steps, log_every, voltage_
             real_obs, obs_wo_cmd, position_read, _imu = create_observation_from_real_robot(
                 servos, q_imu, step, history_length, cpg_reward, prev_action_for_obs
             )
+            yaw = _extract_yaw_from_imu(_imu)
             history_flat = np.concatenate(list(trajectory_history)).astype(np.float32)
             payload = {
                 "type": "obs",
@@ -179,6 +193,7 @@ def run_client(server_ip, server_port, timeout_s, max_steps, log_every, voltage_
                 if prev_action_for_obs is None
                 else [float(x) for x in prev_action_for_obs],
                 "voltage": None if voltage is None else float(voltage),
+                "yaw": yaw,
                 "ts": time.time(),
             }
 

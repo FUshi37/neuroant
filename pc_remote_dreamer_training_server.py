@@ -10,6 +10,7 @@ then the Pi sends reset_done so this process clears RSSM latent state.
 
 import argparse
 import json
+import math
 import os
 import socket
 import time
@@ -35,6 +36,16 @@ from real_robot_dreamer_training import (
 
 def _float_list(x) -> list:
     return [float(v) for v in np.asarray(x, dtype=np.float32).reshape(-1)]
+
+
+def _yaw_to_rad(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    value = float(value)
+    # JY901 yaw is commonly reported in degrees.  Accept radians too.
+    if abs(value) > 2.0 * math.pi:
+        value = math.radians(value)
+    return value
 
 
 class TrainableRWMPolicy(nn.Module):
@@ -350,6 +361,7 @@ class PCRemoteDreamerServer:
         self.reset_pending = False
         self.battery_pending = False
         self.run_id = 0
+        self.yaw_target: Optional[float] = None
         self.step_count = 0
         self.last_loss = None
         self.last_reward_metrics = {}
@@ -378,6 +390,7 @@ class PCRemoteDreamerServer:
         self.need_first = True
         self.reset_pending = False
         self.battery_pending = False
+        self.yaw_target = None
         self.reset_detector.reset()
         self.battery_manager.reset()
         self.train_enabled = bool(self.args.online_train)
@@ -433,6 +446,10 @@ class PCRemoteDreamerServer:
         obs = torch.tensor(msg["obs"], device=self.device, dtype=torch.float32).reshape(1, -1)
         voltage_msg = msg.get("voltage")
         voltage = None if voltage_msg is None else float(voltage_msg)
+        yaw = _yaw_to_rad(msg.get("yaw"))
+        if yaw is not None and self.yaw_target is None:
+            self.yaw_target = yaw
+            print(f"[PC] run_id={self.run_id} yaw target set to {math.degrees(self.yaw_target):.2f} deg")
         prev_action_msg = msg.get("prev_action")
         if prev_action_msg is not None:
             self.prev_action = torch.tensor(
@@ -469,6 +486,13 @@ class PCRemoteDreamerServer:
             "prop": obs,
             "is_first": torch.tensor([self.need_first], device=self.device),
         }
+        if yaw is not None and self.yaw_target is not None:
+            obs_dict["yaw"] = torch.tensor([yaw], device=self.device, dtype=torch.float32)
+            obs_dict["yaw_target"] = torch.tensor(
+                [self.yaw_target],
+                device=self.device,
+                dtype=torch.float32,
+            )
 
         t0 = time.perf_counter()
         with torch.no_grad():
@@ -550,6 +574,8 @@ class PCRemoteDreamerServer:
                     f" reward[real_total={rm.get('real_total', 0.0):.4f}, "
                     f"upright={rm.get('real_upright', 0.0):.4f}, "
                     f"ang={rm.get('real_ang_vel', 0.0):.4f}, "
+                    f"yaw_rate={rm.get('real_yaw_rate', 0.0):.4f}, "
+                    f"yaw_head={rm.get('real_yaw_heading', 0.0):.4f}, "
                     f"cpg={rm.get('real_cpg', 0.0):.4f}, "
                     f"smooth={rm.get('real_smooth', 0.0):.4f}, "
                     f"act={rm.get('real_action_l2', 0.0):.4f}, "

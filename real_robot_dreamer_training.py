@@ -267,8 +267,14 @@ def compute_reward(
     action: torch.Tensor,
     prev_action: torch.Tensor,
     cpg_target: torch.Tensor,
+    yaw: Optional[torch.Tensor] = None,
+    yaw_target: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    return compute_reward_components(obs, action, prev_action, cpg_target)["total"]
+    return compute_reward_components(obs, action, prev_action, cpg_target, yaw, yaw_target)["total"]
+
+
+def wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
 
 
 def compute_reward_components(
@@ -276,6 +282,8 @@ def compute_reward_components(
     action: torch.Tensor,
     prev_action: torch.Tensor,
     cpg_target: torch.Tensor,
+    yaw: Optional[torch.Tensor] = None,
+    yaw_target: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Return weighted reward terms for debugging real-robot behavior."""
     obs = ensure_batch(obs)
@@ -285,6 +293,8 @@ def compute_reward_components(
 
     gravity = obs[..., 3:6].clamp(-2.0, 2.0)
     ang_vel = obs[..., 0:3].clamp(-8.0, 8.0)
+    roll_pitch_rate = ang_vel[..., 0:2]
+    yaw_rate = ang_vel[..., 2]
     joint_pos = obs[..., 9:27].clamp(-3.14, 3.14)
     action = action.clamp(-1.0, 1.0)
     prev_action = prev_action.clamp(-1.0, 1.0)
@@ -294,17 +304,28 @@ def compute_reward_components(
     # with dimension and are non-smooth at zero; squared means give smaller,
     # steadier gradients and reduce action saturation on real hardware.
     r_upright = -torch.mean((gravity - gravity_target) ** 2, dim=-1)
-    r_ang = -torch.mean(ang_vel**2, dim=-1)
+    r_ang = -torch.mean(roll_pitch_rate**2, dim=-1)
+    # projected_gravity cannot observe absolute yaw.  Penalize yaw rate in both
+    # real and imagined states so the gait does not learn to spin in place.
+    r_yaw_rate = -(yaw_rate**2)
     r_cpg = -torch.mean((joint_pos - cpg_target) ** 2, dim=-1)
     r_smooth = -torch.mean((action - prev_action) ** 2, dim=-1)
     r_action = -torch.mean(action**2, dim=-1)
     components = {
         "upright": 2.0 * r_upright,
         "ang_vel": 0.05 * r_ang,
+        "yaw_rate": 0.15 * r_yaw_rate,
         "cpg": 0.5 * r_cpg,
         "smooth": 0.2 * r_smooth,
         "action_l2": 0.05 * r_action,
     }
+    if yaw is not None and yaw_target is not None:
+        yaw = ensure_batch(yaw.reshape(-1, 1)).squeeze(-1).to(obs.device, dtype=obs.dtype)
+        yaw_target = ensure_batch(yaw_target.reshape(-1, 1)).squeeze(-1).to(obs.device, dtype=obs.dtype)
+        # Absolute yaw is available only from real IMU metadata, not from the
+        # WM prop decoder.  It anchors each battery/run to its initial heading.
+        yaw_error = wrap_to_pi(yaw - yaw_target)
+        components["yaw_heading"] = -0.8 * yaw_error**2
     components["total"] = sum(components.values())
     return components
 
@@ -497,6 +518,8 @@ def train_step(
     """
     obs = obs_dict["prop"]
     is_first = obs_dict["is_first"]
+    yaw = obs_dict.get("yaw")
+    yaw_target = obs_dict.get("yaw_target")
     action_real = ensure_batch(action_real)
     prev_action = ensure_batch(prev_action)
 
@@ -520,7 +543,14 @@ def train_step(
 
     feat = world_model.dynamics.get_feat(latent_post)
     action_now = soft_action_limit(policy(obs, None, feat.detach()), cfg.action_limit)
-    real_components = compute_reward_components(obs, action_now, prev_action, cpg_targets[0])
+    real_components = compute_reward_components(
+        obs,
+        action_now,
+        prev_action,
+        cpg_targets[0],
+        yaw=yaw,
+        yaw_target=yaw_target,
+    )
     real_reward = real_components["total"]
 
     imag_rewards, imag_components = imagination_rollout(
