@@ -22,6 +22,7 @@ import torch.nn as nn
 from real_robot_dreamer_training import (
     ACTION_DIM,
     MAX_IMAGINATION_HORIZON,
+    BatteryManager,
     ResetDetector,
     SimplePolicy,
     DummyWorldModel,
@@ -308,10 +309,16 @@ class PCRemoteDreamerServer:
             anomaly_threshold=args.anomaly_threshold,
             anomaly_count_limit=args.anomaly_count_limit,
         )
+        self.battery_manager = BatteryManager(
+            voltage_threshold=args.battery_voltage_threshold,
+            max_steps=args.battery_max_steps,
+        )
         self.prev_latent: Optional[Dict[str, torch.Tensor]] = None
         self.prev_action = torch.zeros(1, ACTION_DIM, device=self.device)
         self.need_first = True
         self.reset_pending = False
+        self.battery_pending = False
+        self.run_id = 0
         self.step_count = 0
         self.last_loss = None
         self.train_enabled = bool(args.online_train)
@@ -338,8 +345,15 @@ class PCRemoteDreamerServer:
         self.prev_action.zero_()
         self.need_first = True
         self.reset_pending = False
+        self.battery_pending = False
         self.reset_detector.reset()
-        print("[PC] reset_done received: latent cleared, next obs will use is_first=True")
+        self.battery_manager.reset()
+        self.train_enabled = bool(self.args.online_train)
+        self.run_id += 1
+        print(
+            "[PC] reset_done received: latent cleared, battery/run counter reset, "
+            "next obs will use is_first=True"
+        )
 
     def _send(self, addr, payload: dict) -> None:
         self.sock.sendto(json.dumps(payload).encode("utf-8"), addr)
@@ -357,17 +371,62 @@ class PCRemoteDreamerServer:
             },
         )
 
+    def _send_battery_reset_required(
+        self,
+        addr,
+        step: int,
+        voltage: Optional[float],
+        reason: str,
+    ) -> None:
+        self.battery_pending = True
+        self.reset_pending = True
+        # Stop training immediately at the run boundary.  Battery sag changes
+        # actuator response, so continuing would mix different dynamics into one
+        # episode and corrupt the RSSM latent/state targets.
+        self.train_enabled = False
+        self._send(
+            addr,
+            {
+                "type": "battery_reset_required",
+                "step": int(step),
+                "ok": False,
+                "reason": reason,
+                "voltage": None if voltage is None else float(voltage),
+                "safe_action": [0.0] * ACTION_DIM,
+            },
+        )
+
     def _handle_obs(self, msg: dict, addr) -> None:
         step = int(msg["step"])
         obs = torch.tensor(msg["obs"], device=self.device, dtype=torch.float32).reshape(1, -1)
+        voltage_msg = msg.get("voltage")
+        voltage = None if voltage_msg is None else float(voltage_msg)
         prev_action_msg = msg.get("prev_action")
         if prev_action_msg is not None:
             self.prev_action = torch.tensor(
                 prev_action_msg, device=self.device, dtype=torch.float32
             ).reshape(1, -1)
 
+        if self.battery_pending:
+            self._send_battery_reset_required(
+                addr,
+                step,
+                voltage,
+                "waiting_for_battery_replacement",
+            )
+            return
+
         if self.reset_pending:
             self._send_reset_required(addr, step, "waiting_for_human_reset")
+            return
+
+        if self.battery_manager.check(voltage):
+            reason = self.battery_manager.reason(voltage)
+            print(
+                f"[PC] stopping run_id={self.run_id} for battery condition: "
+                f"{reason}, voltage={voltage}, run_steps={self.battery_manager.step_count}"
+            )
+            self._send_battery_reset_required(addr, step, voltage, reason)
             return
 
         if self.reset_detector.check(obs, anomaly_error=None):
@@ -433,7 +492,7 @@ class PCRemoteDreamerServer:
                 embed = self.world_model.encoder(obs_dict)
                 self.prev_latent, latent_prior = self.world_model.dynamics.obs_step(
                     self.prev_latent,
-                        self.prev_action.detach(),
+                    self.prev_action.detach(),
                     embed,
                     obs_dict["is_first"],
                     sample=True,
@@ -447,11 +506,13 @@ class PCRemoteDreamerServer:
         self.prev_action.copy_(action.detach())
         self.need_first = False
         self.step_count += 1
+        self.battery_manager.step()
 
         if self.step_count <= 5 or self.step_count % max(1, self.args.log_every) == 0:
             print(
                 f"[PC] step={step} train={int(should_train)} "
                 f"loss={self.last_loss} train_ms={train_ms:.1f} "
+                f"voltage={voltage} run_steps={self.battery_manager.step_count} "
                 f"action[min={float(action.min().detach().cpu()):.4f}, "
                 f"max={float(action.max().detach().cpu()):.4f}, "
                 f"mean={float(action.mean().detach().cpu()):.4f}]"
@@ -522,6 +583,18 @@ def parse_args():
     parser.add_argument("--pitch-threshold", type=float, default=0.6)
     parser.add_argument("--anomaly-threshold", type=float, default=0.2)
     parser.add_argument("--anomaly-count-limit", type=int, default=10)
+    parser.add_argument(
+        "--battery-voltage-threshold",
+        type=float,
+        default=11.0,
+        help="Request battery replacement below this voltage.",
+    )
+    parser.add_argument(
+        "--battery-max-steps",
+        type=int,
+        default=4000,
+        help="Maximum 50Hz control steps per battery run; 0 disables step limit.",
+    )
     parser.add_argument("--log-every", type=int, default=50)
     args = parser.parse_args()
     if args.imagination_horizon > MAX_IMAGINATION_HORIZON:

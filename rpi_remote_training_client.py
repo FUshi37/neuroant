@@ -61,7 +61,7 @@ def _request(sock, server_addr, payload, step, timeout_s):
         data, _ = sock.recvfrom(1024 * 1024)
         resp = json.loads(data.decode("utf-8"))
         resp_type = resp.get("type")
-        if resp_type == "reset_required":
+        if resp_type in ("reset_required", "battery_reset_required"):
             return resp
         if int(resp.get("step", -1)) == int(step):
             return resp
@@ -109,13 +109,22 @@ def _send_safe_pose(servos):
     servos.Robot_initialize(real_angles)
 
 
-def run_client(server_ip, server_port, timeout_s, max_steps, log_every):
+def _read_voltage_safe(servos, last_voltage=None):
+    try:
+        return float(servos.read_voltage(1))
+    except Exception as exc:
+        if last_voltage is None:
+            print(f"[RPI] WARNING failed to read voltage: {exc}")
+        return last_voltage
+
+
+def run_client(server_ip, server_port, timeout_s, max_steps, log_every, voltage_check_every):
     if HARDWARE_IMPORT_ERROR is not None:
         raise RuntimeError(f"hardware import failed: {HARDWARE_IMPORT_ERROR}")
 
     servos = Servos()
-    voltage = servos.read_voltage(1)
-    if voltage < ROBOT_CONFIG["control"]["voltage_threshold"]:
+    voltage = _read_voltage_safe(servos)
+    if voltage is not None and voltage < ROBOT_CONFIG["control"]["voltage_threshold"]:
         print(f"[RPI] WARNING low voltage: {voltage:.2f}V")
     servos.set_position_control()
     position_all = range(ACTION_DIM)
@@ -155,6 +164,8 @@ def run_client(server_ip, server_port, timeout_s, max_steps, log_every):
         step = 0
         while max_steps <= 0 or step < max_steps:
             t_start = time.time()
+            if step == 0 or (step % max(1, int(voltage_check_every)) == 0):
+                voltage = _read_voltage_safe(servos, voltage)
             real_obs, obs_wo_cmd, position_read, _imu = create_observation_from_real_robot(
                 servos, q_imu, step, history_length, cpg_reward, prev_action_for_obs
             )
@@ -167,6 +178,7 @@ def run_client(server_ip, server_port, timeout_s, max_steps, log_every):
                 "prev_action": None
                 if prev_action_for_obs is None
                 else [float(x) for x in prev_action_for_obs],
+                "voltage": None if voltage is None else float(voltage),
                 "ts": time.time(),
             }
 
@@ -178,12 +190,23 @@ def run_client(server_ip, server_port, timeout_s, max_steps, log_every):
                 if fallback_count <= 5 or step % max(1, log_every) == 0:
                     print(f"[RPI] network fallback at step={step}; using last safe action")
 
-            if resp.get("type") == "reset_required":
+            if resp.get("type") in ("reset_required", "battery_reset_required"):
+                is_battery_reset = resp.get("type") == "battery_reset_required"
                 print("\n==============================")
-                print("!!! RESET REQUIRED !!!")
+                print("!!! BATTERY RESET REQUIRED !!!" if is_battery_reset else "!!! RESET REQUIRED !!!")
                 print(f"Reason from PC: {resp.get('reason', 'unknown')}")
-                print("Robot will move to safe neutral pose if possible.")
-                print("Please manually reset the robot to a safe standing pose.")
+                if is_battery_reset:
+                    v = resp.get("voltage", voltage)
+                    if v is None:
+                        print("Current voltage: unavailable")
+                    else:
+                        print(f"Current voltage: {float(v):.2f} V")
+                    print("Robot will move to safe neutral pose if possible.")
+                    print("Please replace the battery with a fully charged one.")
+                    print("Then manually reset the robot to a safe standing pose.")
+                else:
+                    print("Robot will move to safe neutral pose if possible.")
+                    print("Please manually reset the robot to a safe standing pose.")
                 print("Then press ENTER to continue...")
                 print("==============================\n")
                 _send_safe_pose(servos)
@@ -194,6 +217,7 @@ def run_client(server_ip, server_port, timeout_s, max_steps, log_every):
                 for _ in range(history_length):
                     trajectory_history.append(np.zeros(obs_without_command_dim, dtype=np.float32))
                 admittance_needs_init = True
+                voltage = _read_voltage_safe(servos, voltage)
                 _send_reset_done(sock, server_addr, step)
                 print("[RPI] reset_done sent to PC; resuming control")
                 step += 1
@@ -222,6 +246,7 @@ def run_client(server_ip, server_port, timeout_s, max_steps, log_every):
             if step % max(1, log_every) == 0:
                 print(
                     f"[RPI] step={step} ok={net_ok_count} fallback={fallback_count} "
+                    f"voltage={voltage} "
                     f"action[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}]"
                 )
             step += 1
@@ -248,6 +273,7 @@ def main():
     parser.add_argument("--timeout-ms", type=float, default=50.0)
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--voltage-check-every", type=int, default=50)
     args = parser.parse_args()
     run_client(
         server_ip=args.server_ip,
@@ -255,6 +281,7 @@ def main():
         timeout_s=max(0.001, args.timeout_ms / 1000.0),
         max_steps=args.max_steps,
         log_every=args.log_every,
+        voltage_check_every=args.voltage_check_every,
     )
 
 

@@ -35,11 +35,16 @@ class TrainConfig:
     grad_clip: float = 10.0
     max_steps: int = 0
     dry_run: bool = True
+    battery_voltage_threshold: float = 11.9
+    battery_max_steps: int = 20000
 
 
 class RobotIO(Protocol):
     def read_obs(self) -> torch.Tensor:
         """Return obs_prop with shape [45] or [1, 45]."""
+
+    def get_battery_voltage(self) -> float:
+        """Return current battery voltage."""
 
     def send_action(self, action: torch.Tensor) -> None:
         """Send 18-dim joint position targets to the robot."""
@@ -67,6 +72,9 @@ class RealRobotIO:
     def send_action(self, action: torch.Tensor) -> None:
         raise NotImplementedError("Please connect send_action() to Dynamixel targets.")
 
+    def get_battery_voltage(self) -> float:
+        raise NotImplementedError("Please connect get_battery_voltage() to servo/battery telemetry.")
+
     def send_safe_action(self) -> None:
         raise NotImplementedError("Please connect send_safe_action() to a safe standing pose.")
 
@@ -90,6 +98,9 @@ class DryRunRobotIO:
         projected_gravity = torch.tensor([0.0, 0.0, -1.0], device=self.device)
         commands = torch.zeros(3, device=self.device)
         return torch.cat([ang_vel, projected_gravity, commands, self.joint_pos, self.joint_vel])
+
+    def get_battery_voltage(self) -> float:
+        return 12.4
 
     def send_action(self, action: torch.Tensor) -> None:
         action = action.detach().to(self.device).flatten().clamp(-1.0, 1.0)
@@ -150,6 +161,39 @@ class ResetDetector:
         return bool(unstable or stuck)
 
 
+class BatteryManager:
+    """
+    Segment training into battery-limited runs.
+
+    Battery voltage changes actuator speed/torque, so the same action can lead
+    to different transitions later in the discharge curve.  Cutting a run before
+    voltage sag keeps the data distribution more stationary.
+    """
+
+    def __init__(self, voltage_threshold: float = 11.0, max_steps: int = 4000):
+        self.voltage_threshold = float(voltage_threshold)
+        self.max_steps = int(max_steps)
+        self.step_count = 0
+
+    def step(self) -> None:
+        self.step_count += 1
+
+    def check(self, voltage: Optional[float]) -> bool:
+        low_voltage = voltage is not None and float(voltage) < self.voltage_threshold
+        step_limit = self.max_steps > 0 and self.step_count >= self.max_steps
+        return bool(low_voltage or step_limit)
+
+    def reason(self, voltage: Optional[float]) -> str:
+        if voltage is not None and float(voltage) < self.voltage_threshold:
+            return f"battery_low:{float(voltage):.2f}V"
+        if self.max_steps > 0 and self.step_count >= self.max_steps:
+            return f"battery_run_step_limit:{self.step_count}"
+        return "battery_ok"
+
+    def reset(self) -> None:
+        self.step_count = 0
+
+
 class HumanResetHandler:
     """
     Human reset is required because a real hexapod cannot be teleported like a
@@ -176,9 +220,34 @@ class HumanResetHandler:
         input()
         self.waiting_for_reset = False
 
+    def trigger_battery(self, robot: RobotIO, voltage: Optional[float]) -> None:
+        self.waiting_for_reset = True
+        try:
+            robot.send_safe_action()
+        except Exception as exc:
+            print(f"Warning: failed to send safe action before battery reset: {exc}")
+
+        print("\n==============================")
+        print("!!! BATTERY RESET REQUIRED !!!")
+        if voltage is None:
+            print("Current voltage: unavailable")
+        else:
+            print(f"Current voltage: {float(voltage):.2f} V")
+        print("Please replace the battery and reset the robot to a standing pose.")
+        print("Then press ENTER to continue...")
+        print("==============================\n")
+        input()
+        self.waiting_for_reset = False
+
 
 def ensure_batch(x: torch.Tensor) -> torch.Tensor:
     return x.unsqueeze(0) if x.dim() == 1 else x
+
+
+def soft_action_limit(action: torch.Tensor, limit: float) -> torch.Tensor:
+    """Differentiable action limiting for training paths."""
+    limit = float(max(limit, 1e-6))
+    return limit * torch.tanh(action / limit)
 
 
 def decoder_mean(pred):
@@ -204,17 +273,22 @@ def compute_reward(
     prev_action = ensure_batch(prev_action)
     cpg_target = ensure_batch(cpg_target)
 
-    gravity = obs[..., 3:6]
-    ang_vel = obs[..., 0:3]
-    joint_pos = obs[..., 9:27]
+    gravity = obs[..., 3:6].clamp(-2.0, 2.0)
+    ang_vel = obs[..., 0:3].clamp(-8.0, 8.0)
+    joint_pos = obs[..., 9:27].clamp(-3.14, 3.14)
+    action = action.clamp(-1.0, 1.0)
+    prev_action = prev_action.clamp(-1.0, 1.0)
 
     gravity_target = torch.tensor([0.0, 0.0, -1.0], device=obs.device, dtype=obs.dtype)
-    r_stability = -torch.norm(gravity - gravity_target, dim=-1)
-    r_stability = r_stability - 0.3 * torch.norm(ang_vel, dim=-1)
-
-    r_cpg = -torch.norm(joint_pos - cpg_target, dim=-1)
-    r_smooth = -torch.norm(action - prev_action, dim=-1)
-    return r_stability + 0.5 * r_cpg + 0.1 * r_smooth
+    # Use mean-square penalties instead of vector norms.  Norm penalties scale
+    # with dimension and are non-smooth at zero; squared means give smaller,
+    # steadier gradients and reduce action saturation on real hardware.
+    r_upright = -torch.mean((gravity - gravity_target) ** 2, dim=-1)
+    r_ang = -torch.mean(ang_vel**2, dim=-1)
+    r_cpg = -torch.mean((joint_pos - cpg_target) ** 2, dim=-1)
+    r_smooth = -torch.mean((action - prev_action) ** 2, dim=-1)
+    r_action = -torch.mean(action**2, dim=-1)
+    return 2.0 * r_upright + 0.05 * r_ang + 0.5 * r_cpg + 0.2 * r_smooth + 0.05 * r_action
 
 
 def get_cpg_targets(horizon: int, device: torch.device, step: int = 0) -> torch.Tensor:
@@ -340,7 +414,7 @@ def imagination_rollout(
 
     for t in range(horizon):
         feat = world_model.dynamics.get_feat(latent)
-        action = policy.actor(feat)
+        action = soft_action_limit(policy.actor(feat), 1.0)
         latent = world_model.dynamics.img_step(latent, action, sample=True)
         feat_next = world_model.dynamics.get_feat(latent)
         pred = world_model.heads["decoder"](feat_next)
@@ -412,7 +486,7 @@ def train_step(
     cpg_targets = get_cpg_targets(horizon, obs.device, global_step)
 
     feat = world_model.dynamics.get_feat(latent_post)
-    action_now = policy(obs, None, feat.detach()).clamp(-cfg.action_limit, cfg.action_limit)
+    action_now = soft_action_limit(policy(obs, None, feat.detach()), cfg.action_limit)
     real_reward = compute_reward(obs, action_now, prev_action, cpg_targets[0])
 
     imag_rewards = imagination_rollout(
@@ -449,6 +523,10 @@ class RealRobotDreamerTrainer:
         self.device = torch.device(cfg.device)
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=cfg.policy_lr)
         self.reset_detector = ResetDetector()
+        self.battery_manager = BatteryManager(
+            voltage_threshold=cfg.battery_voltage_threshold,
+            max_steps=cfg.battery_max_steps,
+        )
         self.reset_handler = HumanResetHandler()
         self.prev_latent: Optional[Dict[str, torch.Tensor]] = None
         self.prev_action = torch.zeros(1, ACTION_DIM, device=self.device)
@@ -480,6 +558,10 @@ class RealRobotDreamerTrainer:
         self.need_first = True
         self.reset_detector.reset()
 
+    def reset_after_battery_replacement(self) -> None:
+        self.reset_world_model_state()
+        self.battery_manager.reset()
+
     def run(self) -> None:
         dt = 1.0 / float(self.cfg.control_hz)
         print(f"Starting real-robot Dreamer loop at {self.cfg.control_hz:.1f} Hz")
@@ -490,6 +572,16 @@ class RealRobotDreamerTrainer:
             loop_start = time.perf_counter()
             obs = self.robot.read_obs().to(self.device, dtype=torch.float32)
             obs = ensure_batch(obs)
+            try:
+                voltage = float(self.robot.get_battery_voltage())
+            except Exception:
+                voltage = None
+
+            if self.battery_manager.check(voltage):
+                print(f"Stopping training due to battery condition: {self.battery_manager.reason(voltage)}")
+                self.reset_handler.trigger_battery(self.robot, voltage)
+                self.reset_after_battery_replacement()
+                continue
 
             if self.reset_detector.check(obs, anomaly_error=None):
                 self.reset_handler.trigger(self.robot)
@@ -551,6 +643,13 @@ class RealRobotDreamerTrainer:
             self.need_first = False
             self.prev_action.copy_(action.detach())
             self.global_step += 1
+            self.battery_manager.step()
+
+            if self.battery_manager.check(voltage):
+                print(f"Stopping training due to battery condition: {self.battery_manager.reason(voltage)}")
+                self.reset_handler.trigger_battery(self.robot, voltage)
+                self.reset_after_battery_replacement()
+                continue
 
             elapsed = time.perf_counter() - loop_start
             sleep_time = dt - elapsed
@@ -593,6 +692,8 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--train-every-steps", type=int, default=5)
     parser.add_argument("--imagination-horizon", type=int, default=MAX_IMAGINATION_HORIZON)
     parser.add_argument("--max-steps", type=int, default=300)
+    parser.add_argument("--battery-voltage-threshold", type=float, default=11.0)
+    parser.add_argument("--battery-max-steps", type=int, default=4000)
     args = parser.parse_args()
 
     horizon = min(int(args.imagination_horizon), MAX_IMAGINATION_HORIZON)
@@ -606,6 +707,8 @@ def parse_args() -> TrainConfig:
         imagination_horizon=horizon,
         max_steps=args.max_steps,
         dry_run=not args.real,
+        battery_voltage_threshold=args.battery_voltage_threshold,
+        battery_max_steps=args.battery_max_steps,
     )
 
 
