@@ -21,10 +21,11 @@ from test_rwm_real_robot_wm import (
     CONTACT_ANOMALY_THRESHOLD,
     CONTACT_ANOMALY_TRIGGER_COUNT,
     ContactAnomalyDetector,
-    ImaginationStabilityFilter,
     RealRobotRWMInference,
-    get_action_limits,
+    compute_leg_errors,
+    detect_stuck_leg,
 )
+from deployment_safety import WorldModelCandidateSelector
 
 
 def _to_float_list(arr):
@@ -44,13 +45,12 @@ def run_server(
     print(f"[PC] starting WM server at {host}:{port}")
     inference = RealRobotRWMInference(model_path, device="cpu", remove_dof_vel=remove_dof_vel)
     policy = inference.get_inference_policy()
-    stability_filter = (
-        ImaginationStabilityFilter(
+    candidate_selector = (
+        WorldModelCandidateSelector(
             world_model=inference.world_model,
             action_dim=18,
-            horizon=5,
-            num_samples=8,
-            noise_scale=0.05,
+            horizon=4,
+            max_lift_candidates=2,
             device="cpu",
         )
         if (use_stability_filter and inference.world_model is not None)
@@ -69,7 +69,6 @@ def run_server(
         else None
     )
     detector_latent = inference.wm_latent
-    action_limits = get_action_limits()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((host, port))
@@ -85,14 +84,10 @@ def run_server(
             "step",
             "filter_enabled",
             "filter_used",
-            "best_idx",
-            "nominal_score",
-            "best_score",
-            "improvement",
-            "delta",
-            "num_samples",
+            "candidate_selected",
+            "candidate_score",
+            "num_candidates",
             "horizon",
-            "noise_scale",
             "server_ms",
             "action_min",
             "action_max",
@@ -157,28 +152,35 @@ def run_server(
                                     "steps": 0,
                                 }
                                 print(f"[PC] contact anomaly detector error: {e}")
-                    if stability_filter is not None and inference.wm_latent is not None:
+                    bad_leg = None
+                    if candidate_selector is not None and inference.wm_latent is not None:
                         try:
                             prev_action_t = (
                                 None
                                 if prev_action is None
                                 else torch.from_numpy(prev_action).unsqueeze(0)
                             )
-                            actions = stability_filter.select_action(
-                                obs_prop=obs_dict["prop"],
+                            actions = candidate_selector.select(
                                 prev_latent=inference.wm_latent,
-                                action_nominal=actions,
                                 is_first=inference.wm_is_first,
+                                action_nominal=actions,
                                 prev_action=prev_action_t,
                             )
-                            filter_debug = dict(getattr(stability_filter, "last_debug", filter_debug))
+                            filter_debug = dict(getattr(candidate_selector, "last_debug", filter_debug))
                         except Exception as e:
                             # Keep control alive if imagination branch fails.
                             filter_debug = {"used": False, "error": str(e)}
                             print(f"[PC] stability filter disabled for this step: {e}")
 
+                    if contact_detector is not None and anomaly_debug.get("enabled") and anomaly_debug.get("is_anomaly"):
+                        obs_real_for_leg = contact_detector.last_obs_real
+                        obs_pred_for_leg = contact_detector.last_obs_pred
+                        if (obs_real_for_leg is not None) and (obs_pred_for_leg is not None):
+                            leg_errors = compute_leg_errors(obs_real_for_leg, obs_pred_for_leg)
+                            bad_leg = detect_stuck_leg(leg_errors, threshold=CONTACT_ANOMALY_THRESHOLD)
+
                 action_raw = actions.detach().cpu().numpy().reshape(-1)
-                action_raw = np.clip(action_raw, action_limits["min"], action_limits["max"])
+                action_raw = np.clip(action_raw, -1.0, 1.0)
                 server_ms = float((time.perf_counter() - t0) * 1000.0)
 
                 resp = {
@@ -187,21 +189,23 @@ def run_server(
                     "action_raw": _to_float_list(action_raw),
                     "server_ms": server_ms,
                     "ok": True,
+                    "contact_anomaly": bool(anomaly_debug.get("is_anomaly", False)),
+                    "contact_error": float(anomaly_debug.get("error")) if isinstance(anomaly_debug.get("error"), (float, int)) else 0.0,
+                    "contact_steps": int(anomaly_debug.get("steps", 0)),
+                    "bad_leg": int(-1 if bad_leg is None else bad_leg),
+                    "candidate_selected": str(filter_debug.get("selected", "nominal")),
+                    "candidate_score": float(filter_debug.get("score", 0.0)) if isinstance(filter_debug.get("score", 0.0), (float, int)) else 0.0,
                 }
                 packet_count += 1
 
                 row = {
                     "step": step,
-                    "filter_enabled": int(stability_filter is not None),
+                    "filter_enabled": int(candidate_selector is not None),
                     "filter_used": int(bool(filter_debug.get("used", False))),
-                    "best_idx": filter_debug.get("best_idx", ""),
-                    "nominal_score": filter_debug.get("nominal_score", ""),
-                    "best_score": filter_debug.get("best_score", ""),
-                    "improvement": filter_debug.get("improvement", ""),
-                    "delta": filter_debug.get("delta", ""),
-                    "num_samples": filter_debug.get("num_samples", ""),
-                    "horizon": filter_debug.get("horizon", ""),
-                    "noise_scale": filter_debug.get("noise_scale", ""),
+                    "candidate_selected": filter_debug.get("selected", ""),
+                    "candidate_score": filter_debug.get("score", ""),
+                    "num_candidates": filter_debug.get("num_candidates", ""),
+                    "horizon": 4,
                     "server_ms": server_ms,
                     "action_min": float(action_raw.min()),
                     "action_max": float(action_raw.max()),
@@ -216,11 +220,12 @@ def run_server(
                         f"from={addr[0]}:{addr[1]} step={step} "
                         f"act[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
                         f"server={server_ms:.2f}ms "
-                        f"filter_used={row['filter_used']} improve={row['improvement']} delta={row['delta']} "
+                        f"filter_used={row['filter_used']} cand={row['candidate_selected']} score={row['candidate_score']} "
                         f"contact_enabled={int(anomaly_debug['enabled'])} "
                         f"contact_anomaly={int(anomaly_debug['is_anomaly'])} "
                         f"contact_error={anomaly_debug['error']} "
-                        f"contact_steps={anomaly_debug['steps']}"
+                        f"contact_steps={anomaly_debug['steps']} "
+                        f"bad_leg={-1 if bad_leg is None else bad_leg}"
                     )
             except Exception as e:
                 resp = {

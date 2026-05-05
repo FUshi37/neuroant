@@ -9,6 +9,7 @@ import numpy as np
 from collections import deque
 import sys
 import contextlib
+import csv
 
 # Real robot hardware imports (optional on PC-side inference service)
 HARDWARE_IMPORT_ERROR = None
@@ -27,6 +28,13 @@ from multiprocessing import Process, Queue
 
 # Import RWM model components
 from world_model.actor_cirtic_rwm import ActorCriticRWM
+from deployment_safety import (
+    RiskLevelEstimator,
+    SafetyActionFilter,
+    WorldModelCandidateSelector,
+    default_action_scale_per_dim,
+    policy_action_to_exec_rad,
+)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 VALIDATION_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "validation_outputs")
@@ -76,15 +84,7 @@ MAX_STEPS = 1000
 # 策略输出逐维缩放（与 action 索引一致）：
 # [0:3] l1_bc,l1_cf,l1_ft  [3:6] l2  [6:9] l3  [9:12] r1  [12:15] r2  [15:18] r3
 ACTION_SCALE_PER_DIM = np.array(
-    [
-        0.50, 0.50, 0.50,  # l1
-        0.50, 0.50, 0.50,  # l2
-        0.50, 0.50, 0.50,  # l3
-        0.50, 0.50, 0.50,  # r1
-        0.50, 0.50, 0.50,  # r2
-        0.50, 0.50, 0.50,  # r3
-    ],
-    dtype=np.float32,
+    default_action_scale_per_dim(), dtype=np.float32
 )
 cpg_reward = True
 remove_dof_vel = True  # when True: remove dof_vel(18) from observation/history
@@ -2501,12 +2501,11 @@ def test_rwm_real_robot_wm(model_path):
     # Initialize RWM inference
     rwm_inference = RealRobotRWMInference(model_path, device='cpu', remove_dof_vel=remove_dof_vel)
     policy = rwm_inference.get_inference_policy()
-    stability_filter = ImaginationStabilityFilter(
+    candidate_selector = WorldModelCandidateSelector(
         world_model=rwm_inference.world_model,
         action_dim=18,
-        horizon=5,
-        num_samples=8,
-        noise_scale=0.05,
+        horizon=4,
+        max_lift_candidates=2,
         device='cpu',
     ) if rwm_inference.world_model is not None else None
     contact_detector = ContactAnomalyDetector(
@@ -2522,6 +2521,7 @@ def test_rwm_real_robot_wm(model_path):
     detector_last_anomaly = False
     detector_last_steps = 0
     lift_controller = LegLiftController(lift_steps=4)
+    risk_estimator = RiskLevelEstimator()
 
     # Initialize real robot components
     print("📍 Step 1: Initializing Servos...")
@@ -2630,7 +2630,7 @@ def test_rwm_real_robot_wm(model_path):
     history_dim = obs_without_command_dim * history_length
     # 复用 history 张量，避免每步 torch.tensor 分配
     history_tensor_buf = torch.zeros(1, history_dim, dtype=torch.float32, device='cpu')
-    action_scale_t = torch.as_tensor(ACTION_SCALE_PER_DIM, dtype=torch.float32, device='cpu')
+    action_scale_np = np.asarray(ACTION_SCALE_PER_DIM, dtype=np.float32)
     trajectory_history = deque(maxlen=history_length)
 
     # Initialize with zeros
@@ -2642,6 +2642,7 @@ def test_rwm_real_robot_wm(model_path):
     print("Action limits calculated to prevent servo angle clipping:")
     print(f"  Min action limits (degrees): {np.degrees(action_limits['min'])}")
     print(f"  Max action limits (degrees): {np.degrees(action_limits['max'])}")
+    safety_filter = SafetyActionFilter(action_limits=action_limits)
 
     # Admittance controller to smooth actions
     admittance_filter = AdmittanceFilter(
@@ -2664,10 +2665,12 @@ def test_rwm_real_robot_wm(model_path):
     actions_file = os.path.join(output_dir, "actions_output.txt")
     observations_file = os.path.join(output_dir, "observations_output.txt")
     policy_input_file = os.path.join(output_dir, "policy_input.txt")
+    safety_debug_file = os.path.join(output_dir, "safety_debug.csv")
 
     print(f"Actions will be logged to: {actions_file}")
     print(f"Observations will be logged to: {observations_file}")
     print(f"Policy inputs will be logged to: {policy_input_file}")
+    print(f"Safety debug will be logged to: {safety_debug_file}")
 
     step = 0
     max_steps = MAX_STEPS  # Longer test run for better evaluation
@@ -2682,7 +2685,7 @@ def test_rwm_real_robot_wm(model_path):
     print("Starting control loop...")
 
     try:
-        with open(actions_file, 'w') as f_actions, open(observations_file, 'w') as f_obs, open(policy_input_file, 'w') as f_pi:
+        with open(actions_file, 'w') as f_actions, open(observations_file, 'w') as f_obs, open(policy_input_file, 'w') as f_pi, open(safety_debug_file, "w", newline="") as f_sd:
             # Set up keyboard interrupt handler for emergency stop
             import signal
             import sys
@@ -2718,6 +2721,17 @@ def test_rwm_real_robot_wm(model_path):
             f_actions.write("step\tactions_18\tangles_18\tticks_18\n")
             f_obs.write("step\tbase_ang_vel_3\tprojected_gravity_3\tcommands_3\tdof_pos_18\tdof_vel_18\tobs_action_18\troll\tpitch\tyaw\n")
             f_pi.write("step\tcommand\thistory\twm_feature\n")
+            safety_writer = csv.DictWriter(
+                f_sd,
+                fieldnames=[
+                    "step", "raw_action_min", "raw_action_max", "raw_action_mean",
+                    "exec_action_min", "exec_action_max", "exec_action_mean",
+                    "risk_level", "wm_error", "contact_error", "contact_anomaly", "contact_steps",
+                    "candidate_selected", "candidate_score", "max_delta_before_filter",
+                    "max_delta_after_filter", "ankle_delta_max",
+                ],
+            )
+            safety_writer.writeheader()
 
             print("Log files opened successfully")
 
@@ -2812,15 +2826,14 @@ def test_rwm_real_robot_wm(model_path):
                 #print("wm_feature: ", wm_feature)
                 action_nominal = policy(obs_dict["prop"], history_tensor, wm_feature)
                 actions = action_nominal
-                if stability_filter is not None and rwm_inference.wm_latent is not None:
+                if candidate_selector is not None and rwm_inference.wm_latent is not None:
                     prev_action_t = None if previous_actions is None else torch.from_numpy(
                         np.asarray(previous_actions, dtype=np.float32)
                     ).unsqueeze(0)
-                    actions = stability_filter.select_action(
-                        obs_prop=obs_dict["prop"],
+                    actions = candidate_selector.select(
                         prev_latent=rwm_inference.wm_latent,
-                        action_nominal=actions,
                         is_first=rwm_inference.wm_is_first,
+                        action_nominal=actions,
                         prev_action=prev_action_t,
                     )
                 if contact_detector is not None:
@@ -2857,45 +2870,50 @@ def test_rwm_real_robot_wm(model_path):
                 actions = lift_controller.apply(actions)
                 #print("actions: ", actions)
 
-                # For obs_without_command (next step): use clip-only, before scale and before asymmetric mapping (align with sim)
-                action_raw_np = actions.detach().cpu().numpy().flatten()
-                action_for_obs = np.clip(action_raw_np, action_limits['min'], action_limits['max'])
+                # Keep policy action in simulation space for observation/history.
+                action_raw_np = actions.detach().cpu().numpy().flatten().astype(np.float32)
+                action_for_obs = np.clip(action_raw_np, -1.0, 1.0)
 
-                # Apply per-dimension action scaling for safety（复用预构建 scale，CPU float32）
-                if actions.dim() == 2:
-                    actions = actions * action_scale_t.unsqueeze(0)
-                else:
-                    actions = actions * action_scale_t
+                # Risk estimation (world-model anomaly now drives execution safety).
+                contact_error_value = 0.0
+                if detector_last_error is not None:
+                    if torch.is_tensor(detector_last_error):
+                        contact_error_value = float(torch.max(detector_last_error).detach().cpu().item())
+                    else:
+                        contact_error_value = float(detector_last_error)
+                risk_state = risk_estimator.update(
+                    wm_error=contact_error_value,
+                    contact_anomaly=bool(detector_last_anomaly),
+                    contact_steps=int(detector_last_steps),
+                    bad_leg=lift_controller.leg_id if lift_controller.active else None,
+                )
 
-                # Convert actions (for execution)
-                action_np = actions.detach().cpu().numpy().flatten()
-
-                # Optional: apply asymmetric ankle mapping (to match simulation training semantics)
-                if USE_ASYMMETRIC_ANKLE_MAPPING:
-                    action_np = apply_asymmetric_ankle_mapping_rad(
-                        action_np,
-                        lift_range_rad=ASYM_ANKLE_LIFT_RANGE_RAD,
-                        sink_range_rad=ASYM_ANKLE_SINK_RANGE_RAD,
-                    )
-
-                # Limit action before admittance filtering
-                action_limited = np.clip(action_np, action_limits['min'], action_limits['max'])
+                # Convert policy-space action to execution rad, then apply hard safety filter.
+                action_exec_desired = policy_action_to_exec_rad(
+                    action_raw_clipped=action_for_obs,
+                    action_scale_per_dim=action_scale_np,
+                    use_asymmetric_ankle_mapping=USE_ASYMMETRIC_ANKLE_MAPPING,
+                    asym_lift_range_rad=ASYM_ANKLE_LIFT_RANGE_RAD,
+                    asym_sink_range_rad=ASYM_ANKLE_SINK_RANGE_RAD,
+                )
+                action_exec_desired = np.clip(action_exec_desired, action_limits['min'], action_limits['max'])
+                action_limited, safety_dbg = safety_filter.filter(action_exec_desired, risk_state.level)
 
                 # Check if any actions were clipped
-                action_clipped = np.any(action_np != action_limited)
+                action_clipped = np.any(action_exec_desired != action_limited)
                 if action_clipped and ENABLE_ACTION_CLIP_PRINT:
-                    clipped_count = np.sum(action_np != action_limited)
+                    clipped_count = np.sum(action_exec_desired != action_limited)
                     print(f"  ⚠️  {clipped_count} actions were clipped to stay within safe limits")
                     # Log which actions were clipped (optional)
                     for i in range(18):
-                        if action_np[i] != action_limited[i]:
-                            print(f"     Action {i}: {np.degrees(action_np[i]):.2f}° -> {np.degrees(action_limited[i]):.2f}°")
+                        if action_exec_desired[i] != action_limited[i]:
+                            print(f"     Action {i}: {np.degrees(action_exec_desired[i]):.2f}° -> {np.degrees(action_limited[i]):.2f}°")
 
                     # Extra debug: show raw ankle actions (before clipping)
                     ankle_indices = [2, 5, 8, 11, 14, 17]
-                    clipped_ankles = [i for i in ankle_indices if action_np[i] != action_limited[i]]
+                    clipped_ankles = [i for i in ankle_indices if action_exec_desired[i] != action_limited[i]]
                     if clipped_ankles:
-                        raw_deg = {i: float(np.degrees(action_np[i])) for i in ankle_indices}
+                        raw_deg = {i: float(np.degrees(action_exec_desired[i])) for i in ankle_indices}
                         lim_deg = {i: float(np.degrees(action_limited[i])) for i in ankle_indices}
                         lim_min_deg = {i: float(np.degrees(action_limits['min'][i])) for i in ankle_indices}
                         lim_max_deg = {i: float(np.degrees(action_limits['max'][i])) for i in ankle_indices}
@@ -2914,6 +2932,7 @@ def test_rwm_real_robot_wm(model_path):
                         current_sim_angles = servo_angles_to_sim_angles(position_Read)
                         init_action = np.clip(current_sim_angles, action_limits['min'], action_limits['max'])
                         admittance_filter.reset(init_action)
+                        safety_filter.reset(init_action)
                         admittance_needs_init = False
                     action_filtered = admittance_filter.update(action_limited)
                     action_filtered = np.clip(action_filtered, action_limits['min'], action_limits['max'])
@@ -2982,7 +3001,7 @@ def test_rwm_real_robot_wm(model_path):
                 # Print validation info (less verbose)
                 if ENABLE_CONTROL_PRINT and (step % 10 == 0 or step < 3):
                     print(f"   📊 Step {step} completed:")
-                    print(f"      Actions: Range=[{action_np.min():.3f}, {action_np.max():.3f}], Mean={action_np.mean():.3f}")
+                    print(f"      Actions: Range=[{action_exec_desired.min():.3f}, {action_exec_desired.max():.3f}], Mean={action_exec_desired.mean():.3f}")
                     print(f"      Angles: Range=[{real_angles.min():.1f}, {real_angles.max():.1f}]°")
                     print(f"      ✓ All safety checks passed")
 
@@ -3041,6 +3060,31 @@ def test_rwm_real_robot_wm(model_path):
 
                 # Update previous actions for next history input (sim-aligned: clip-only, scale前, 非对称映射前)
                 previous_actions = action_for_obs.copy()
+
+                candidate_debug = getattr(candidate_selector, "last_debug", {}) if candidate_selector is not None else {}
+                safety_writer.writerow(
+                    {
+                        "step": step,
+                        "raw_action_min": float(action_for_obs.min()),
+                        "raw_action_max": float(action_for_obs.max()),
+                        "raw_action_mean": float(action_for_obs.mean()),
+                        "exec_action_min": float(action_filtered.min()),
+                        "exec_action_max": float(action_filtered.max()),
+                        "exec_action_mean": float(action_filtered.mean()),
+                        "risk_level": int(risk_state.level),
+                        "wm_error": float(risk_state.ema_error),
+                        "contact_error": float(contact_error_value),
+                        "contact_anomaly": int(bool(detector_last_anomaly)),
+                        "contact_steps": int(detector_last_steps),
+                        "candidate_selected": candidate_debug.get("selected", "nominal"),
+                        "candidate_score": candidate_debug.get("score", 0.0),
+                        "max_delta_before_filter": safety_dbg.get("max_delta_before_filter", 0.0),
+                        "max_delta_after_filter": safety_dbg.get("max_delta_after_filter", 0.0),
+                        "ankle_delta_max": safety_dbg.get("ankle_delta_max", 0.0),
+                    }
+                )
+                if (step % LOG_FLUSH_EVERY_N_STEPS) == 0:
+                    f_sd.flush()
 
                 if ENABLE_TIMING_REPORT and step > 0 and (step % TIMING_REPORT_EVERY_N_STEPS) == 0:
                     sensor_ms = (sensor_end_pc - sensor_start_pc) * 1000.0
@@ -3271,6 +3315,66 @@ def verify_action_limits():
     print("Action limits verification completed.")
 
 
+def verify_safety():
+    """Synthetic safety checks for deployment-side action manager."""
+    print("\nVerifying deployment safety filter...")
+    action_limits = get_action_limits()
+    sf = SafetyActionFilter(action_limits=action_limits)
+    risk = RiskLevelEstimator()
+    current = np.zeros(18, dtype=np.float32)
+    sf.reset(current)
+
+    seq = [
+        np.zeros(18, dtype=np.float32),
+        np.ones(18, dtype=np.float32),
+        -np.ones(18, dtype=np.float32),
+        np.concatenate([np.full(12, 0.8, dtype=np.float32), np.full(6, -1.0, dtype=np.float32)]),
+    ]
+    ok_rate = True
+    ok_prev = True
+    ok_ankle_down = True
+    ok_risk_tighten = True
+    prev_obs_actions = []
+    low_risk_after = None
+    high_risk_after = None
+    for i, raw in enumerate(seq):
+        raw_clipped = np.clip(raw, -1.0, 1.0)
+        prev_obs_actions.append(raw_clipped.copy())
+        exec_des = policy_action_to_exec_rad(
+            raw_clipped,
+            action_scale_per_dim=np.asarray(ACTION_SCALE_PER_DIM, dtype=np.float32),
+            use_asymmetric_ankle_mapping=USE_ASYMMETRIC_ANKLE_MAPPING,
+            asym_lift_range_rad=ASYM_ANKLE_LIFT_RANGE_RAD,
+            asym_sink_range_rad=ASYM_ANKLE_SINK_RANGE_RAD,
+        )
+        if i < 2:
+            rs = risk.update(wm_error=0.02, contact_anomaly=False, contact_steps=0)
+        else:
+            rs = risk.update(wm_error=0.30, contact_anomaly=True, contact_steps=3)
+        filtered, dbg = sf.filter(exec_des, rs.level)
+        if rs.level == 0:
+            low_risk_after = dbg["ankle_delta_max"]
+        if rs.level == 2:
+            high_risk_after = dbg["ankle_delta_max"]
+        if dbg["max_delta_after_filter"] > np.radians(3.1):
+            ok_rate = False
+        if np.any(np.abs(raw_clipped) > 1.0001):
+            ok_prev = False
+        if rs.level >= 2 and dbg["ankle_delta_max"] > np.radians(1.1):
+            ok_ankle_down = False
+
+    if (low_risk_after is not None) and (high_risk_after is not None):
+        ok_risk_tighten = bool(high_risk_after < low_risk_after)
+
+    print(f"  raw action kept in [-1,1]: {'PASS' if ok_prev else 'FAIL'}")
+    print(f"  per-step delta limited: {'PASS' if ok_rate else 'FAIL'}")
+    print(f"  high-risk ankle tightening: {'PASS' if ok_ankle_down else 'FAIL'}")
+    print(f"  risk level tightens action: {'PASS' if ok_risk_tighten else 'FAIL'}")
+    all_ok = ok_prev and ok_rate and ok_ankle_down and ok_risk_tighten
+    print(f"verify-safety result: {'PASS' if all_ok else 'FAIL'}")
+    return all_ok
+
+
 if __name__ == '__main__':
     import sys
     remote_ip = None
@@ -3333,13 +3437,15 @@ if __name__ == '__main__':
             verify_action_limits()
         elif sys.argv[1] == '--verify-mapping':
             verify_joint_mapping()
+        elif sys.argv[1] == '--verify-safety':
+            verify_safety()
         elif sys.argv[1] == '--imu-test':
             run_imu_test_only()
         elif sys.argv[1] == '--replay-sim-dof':
             sim_path = sys.argv[2] if len(sys.argv) > 2 else None
             run_replay_sim_dof(sim_path)
         else:
-            print("Usage: python test_rwm_real_robot_wm.py [--verify|--verify-limits|--verify-mapping|--imu-test|--replay-sim-dof [sim_data_path]|--remote-wm-server-ip <PC_IP> [--remote-wm-server-port <PORT>]|--pc-wm-server [--model-path PATH] [--host HOST] [--port PORT] [--remove-dof-vel] [--use-stability-filter]]")
+            print("Usage: python test_rwm_real_robot_wm.py [--verify|--verify-limits|--verify-mapping|--verify-safety|--imu-test|--replay-sim-dof [sim_data_path]|--remote-wm-server-ip <PC_IP> [--remote-wm-server-port <PORT>]|--pc-wm-server [--model-path PATH] [--host HOST] [--port PORT] [--remove-dof-vel] [--use-stability-filter]]")
     else:
         # Path to your trained RWM model checkpoint
         current_dir = os.path.dirname(os.path.abspath(__file__))

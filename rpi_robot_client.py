@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import os
 import socket
@@ -9,7 +10,6 @@ from multiprocessing import Process, Queue
 import numpy as np
 
 from test_rwm_real_robot_wm import (
-    ACTION_SCALE_PER_DIM,
     AdmittanceFilter,
     HARDWARE_IMPORT_ERROR,
     MAX_STEPS,
@@ -18,12 +18,17 @@ from test_rwm_real_robot_wm import (
     USE_ADMITTANCE,
     action_to_servo_angles,
     angles_to_ticks,
-    apply_asymmetric_ankle_mapping_rad,
     create_observation_from_real_robot,
     get_action_limits,
     radians_to_degrees,
     read_imu,
     servo_angles_to_sim_angles,
+)
+from deployment_safety import (
+    RiskLevelEstimator,
+    SafetyActionFilter,
+    default_action_scale_per_dim,
+    policy_action_to_exec_rad,
 )
 from Servos import Servos
 
@@ -98,8 +103,10 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
     for _ in range(history_length):
         trajectory_history.append(np.zeros(obs_without_command_dim, dtype=np.float32))
 
-    action_scale = np.asarray(ACTION_SCALE_PER_DIM, dtype=np.float32)
+    action_scale = default_action_scale_per_dim().astype(np.float32)
     action_limits = get_action_limits()
+    safety_filter = SafetyActionFilter(action_limits=action_limits)
+    risk_estimator = RiskLevelEstimator()
     admittance_filter = AdmittanceFilter(m=0.5, d=15.0, k=80.0, dt=TARGET_DT, num_joints=18)
     admittance_needs_init = True
 
@@ -118,17 +125,31 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
     os.makedirs(output_dir, exist_ok=True)
     actions_file = os.path.join(output_dir, "actions_output.txt")
     observations_file = os.path.join(output_dir, "observations_output.txt")
+    safety_debug_file = os.path.join(output_dir, "safety_debug.csv")
     print(f"[RPI] Actions will be logged to: {actions_file}")
     print(f"[RPI] Observations will be logged to: {observations_file}")
+    print(f"[RPI] Safety debug will be logged to: {safety_debug_file}")
 
     try:
-        with open(actions_file, "w") as f_actions, open(observations_file, "w") as f_obs:
+        with open(actions_file, "w") as f_actions, open(observations_file, "w") as f_obs, open(safety_debug_file, "w", newline="") as f_sd:
             f_actions.write("step\tactions_18\tangles_18\tticks_18\n")
             f_obs.write(
                 "step\tbase_ang_vel_3\tprojected_gravity_3\tcommands_3\tdof_pos_18\tdof_vel_18\tobs_action_18\troll\tpitch\tyaw\n"
             )
+            sd_writer = csv.DictWriter(
+                f_sd,
+                fieldnames=[
+                    "step", "raw_action_min", "raw_action_max", "raw_action_mean",
+                    "exec_action_min", "exec_action_max", "exec_action_mean",
+                    "risk_level", "wm_error", "contact_error", "contact_anomaly", "contact_steps",
+                    "candidate_selected", "candidate_score", "max_delta_before_filter",
+                    "max_delta_after_filter", "ankle_delta_max",
+                ],
+            )
+            sd_writer.writeheader()
             for step in range(MAX_STEPS):
                 t_start = time.time()
+                resp = {}
                 real_obs, obs_wo_cmd, position_read, imu_data = create_observation_from_real_robot(
                     servos, q_imu, step, history_length, cpg_reward, prev_action_for_obs
                 )
@@ -169,22 +190,34 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                 if (step % LOG_FLUSH_EVERY_N_STEPS) == 0:
                     f_obs.flush()
 
-                action_for_obs = np.clip(action_raw, action_limits["min"], action_limits["max"])
+                action_for_obs = np.clip(action_raw, -1.0, 1.0)
                 prev_action_for_obs = action_for_obs.copy()
 
-                action_exec = action_for_obs * action_scale
-                if USE_ASYMMETRIC_ANKLE_MAPPING:
-                    action_exec = apply_asymmetric_ankle_mapping_rad(
-                        action_exec,
-                        lift_range_rad=ASYM_ANKLE_LIFT_RANGE_RAD,
-                        sink_range_rad=ASYM_ANKLE_SINK_RANGE_RAD,
-                    )
+                contact_error = float(resp.get("contact_error", 0.0))
+                contact_steps = int(resp.get("contact_steps", 0))
+                contact_anomaly = bool(resp.get("contact_anomaly", False))
+                risk_state = risk_estimator.update(
+                    wm_error=contact_error,
+                    contact_anomaly=contact_anomaly,
+                    contact_steps=contact_steps,
+                    bad_leg=int(resp.get("bad_leg", -1)),
+                )
 
-                action_exec = np.clip(action_exec, action_limits["min"], action_limits["max"])
+                action_exec_desired = policy_action_to_exec_rad(
+                    action_raw_clipped=action_for_obs,
+                    action_scale_per_dim=action_scale,
+                    use_asymmetric_ankle_mapping=USE_ASYMMETRIC_ANKLE_MAPPING,
+                    asym_lift_range_rad=ASYM_ANKLE_LIFT_RANGE_RAD,
+                    asym_sink_range_rad=ASYM_ANKLE_SINK_RANGE_RAD,
+                )
+                action_exec_desired = np.clip(action_exec_desired, action_limits["min"], action_limits["max"])
+                action_exec, safety_dbg = safety_filter.filter(action_exec_desired, risk_state.level)
                 if USE_ADMITTANCE:
                     if admittance_needs_init:
                         current_sim_angles = servo_angles_to_sim_angles(position_read)
-                        admittance_filter.reset(np.clip(current_sim_angles, action_limits["min"], action_limits["max"]))
+                        init_action = np.clip(current_sim_angles, action_limits["min"], action_limits["max"])
+                        admittance_filter.reset(init_action)
+                        safety_filter.reset(init_action)
                         admittance_needs_init = False
                     action_exec = admittance_filter.update(action_exec)
                     action_exec = np.clip(action_exec, action_limits["min"], action_limits["max"])
@@ -202,6 +235,29 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                 f_actions.write(f"{step}\t{actions_str}\t{servo_angles_str}\t{ticks_str}\n")
                 if (step % LOG_FLUSH_EVERY_N_STEPS) == 0:
                     f_actions.flush()
+                    f_sd.flush()
+
+                sd_writer.writerow(
+                    {
+                        "step": step,
+                        "raw_action_min": float(action_for_obs.min()),
+                        "raw_action_max": float(action_for_obs.max()),
+                        "raw_action_mean": float(action_for_obs.mean()),
+                        "exec_action_min": float(action_exec.min()),
+                        "exec_action_max": float(action_exec.max()),
+                        "exec_action_mean": float(action_exec.mean()),
+                        "risk_level": int(risk_state.level),
+                        "wm_error": float(risk_state.ema_error),
+                        "contact_error": float(contact_error),
+                        "contact_anomaly": int(contact_anomaly),
+                        "contact_steps": int(contact_steps),
+                        "candidate_selected": str(resp.get("candidate_selected", "nominal")),
+                        "candidate_score": float(resp.get("candidate_score", 0.0)),
+                        "max_delta_before_filter": safety_dbg.get("max_delta_before_filter", 0.0),
+                        "max_delta_after_filter": safety_dbg.get("max_delta_after_filter", 0.0),
+                        "ankle_delta_max": safety_dbg.get("ankle_delta_max", 0.0),
+                    }
+                )
 
                 trajectory_history.append(obs_wo_cmd.copy())
                 while (time.time() - t_start) < TARGET_DT:
@@ -211,7 +267,8 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                     print(
                         f"[RPI] step={step} "
                         f"net_ok={net_ok_count} fallback={net_fallback_count} "
-                        f"raw[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}]"
+                        f"raw[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
+                        f"risk={risk_state.level} contact_anomaly={int(contact_anomaly)} contact_steps={contact_steps}"
                     )
     finally:
         try:
