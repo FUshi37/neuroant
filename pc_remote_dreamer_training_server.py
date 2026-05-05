@@ -369,12 +369,15 @@ class PCRemoteDreamerServer:
         self.last_loss = None
         self.last_reward_metrics = {}
         self.train_enabled = bool(args.online_train)
+        self.last_saved_step = -1
 
         self.zero_wm_feature = self._make_zero_wm_feature()
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((args.host, args.port))
         self.sock.settimeout(1.0)
+        if int(self.args.save_every_steps) > 0:
+            os.makedirs(self.args.ckpt_dir, exist_ok=True)
 
     def _make_zero_wm_feature(self) -> torch.Tensor:
         dynamics = self.world_model.dynamics
@@ -397,6 +400,7 @@ class PCRemoteDreamerServer:
         self.reset_detector.reset()
         self.battery_manager.reset()
         self.train_enabled = bool(self.args.online_train)
+        self._save_checkpoint(reason="run_reset")
         self.run_id += 1
         print(
             "[PC] reset_done received: latent cleared, battery/run counter reset, "
@@ -405,6 +409,37 @@ class PCRemoteDreamerServer:
 
     def _send(self, addr, payload: dict) -> None:
         self.sock.sendto(json.dumps(payload).encode("utf-8"), addr)
+
+    def _save_checkpoint(self, reason: str) -> None:
+        if int(self.args.save_every_steps) <= 0:
+            return
+        step = int(self.step_count)
+        if reason == "periodic" and step == self.last_saved_step:
+            return
+
+        actor_critic = getattr(self.policy, "actor_critic", None)
+        if actor_critic is None:
+            return
+
+        wm_core = getattr(self.world_model, "world_model", self.world_model)
+        ckpt = {
+            "iter": step,
+            "run_id": int(self.run_id),
+            "reason": str(reason),
+            "model_state_dict": actor_critic.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "last_loss": self.last_loss,
+            "last_reward_metrics": dict(self.last_reward_metrics),
+        }
+        wm_sd = wm_core.state_dict()
+        ckpt["world_model_dict"] = wm_sd
+        ckpt["world_model"] = wm_sd
+
+        filename = f"remote_step_{step:07d}_run_{self.run_id:03d}.pt"
+        path = os.path.join(self.args.ckpt_dir, filename)
+        torch.save(ckpt, path)
+        self.last_saved_step = step
+        print(f"[PC] checkpoint saved ({reason}): {path}")
 
     def _send_reset_required(self, addr, step: int, reason: str) -> None:
         self.reset_pending = True
@@ -568,6 +603,8 @@ class PCRemoteDreamerServer:
         self.need_first = False
         self.step_count += 1
         self.battery_manager.step()
+        if int(self.args.save_every_steps) > 0 and self.step_count % int(self.args.save_every_steps) == 0:
+            self._save_checkpoint(reason="periodic")
 
         if self.step_count <= 5 or self.step_count % max(1, self.args.log_every) == 0:
             rm = self.last_reward_metrics
@@ -697,6 +734,18 @@ def parse_args():
         type=int,
         default=4000,
         help="Maximum 50Hz control steps per battery run; 0 disables step limit.",
+    )
+    parser.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=5000,
+        help="Save checkpoint every N control steps. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--ckpt-dir",
+        type=str,
+        default="checkpoints_remote",
+        help="Directory for saved checkpoints.",
     )
     parser.add_argument("--log-every", type=int, default=50)
     args = parser.parse_args()
