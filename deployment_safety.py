@@ -7,14 +7,13 @@ import torch
 
 
 ANKLE_INDICES = np.array([2, 5, 8, 11, 14, 17], dtype=np.int64)
-HIP_KNEE_INDICES = np.array([i for i in range(18) if i not in set(ANKLE_INDICES.tolist())], dtype=np.int64)
 LIFT_DIR = np.array([1, 1, 1, -1, -1, -1], dtype=np.float32)
 
 
 # Deployment-side execution scale (rad per normalized action unit).
-# Recommended: hip/knee ~0.12-0.18. Keep ankle base scale 1.0 when asym mapping is enabled.
-DEFAULT_HIP_KNEE_SCALE_RAD = 0.15
-DEFAULT_ANKLE_BASE_SCALE_RAD = 1.0
+# Keep defaults aligned with test_rwm_real_robot.py legacy runtime behavior.
+DEFAULT_HIP_KNEE_SCALE_RAD = 0.50
+DEFAULT_ANKLE_BASE_SCALE_RAD = 0.50
 
 # Safety limits (rad per control step). Recommended ranges in comments.
 SAFETY_HIP_KNEE_MAX_DELTA_RAD = math.radians(2.5)  # 2~3 deg/step
@@ -48,14 +47,17 @@ def _ankle_down_mask(delta: np.ndarray) -> np.ndarray:
     return aligned < 0.0
 
 
-def apply_asymmetric_ankle_mapping_from_raw(
-    action_raw_clipped: np.ndarray,
+def apply_asymmetric_ankle_mapping_rad(
+    actions_rad: np.ndarray,
     lift_range_rad: float,
     sink_range_rad: float,
 ) -> np.ndarray:
-    out = np.asarray(action_raw_clipped, dtype=np.float32).copy()
+    """Match test_rwm_real_robot.py asymmetric ankle mapping in radians."""
+    out = np.asarray(actions_rad, dtype=np.float32).copy()
     aligned = out[ANKLE_INDICES] * LIFT_DIR
-    mapped = np.where(aligned >= 0.0, aligned * lift_range_rad, aligned * sink_range_rad)
+    denom = lift_range_rad if lift_range_rad > 1e-6 else 1e-6
+    aligned_n = np.clip(aligned / denom, -1.0, 1.0)
+    mapped = np.where(aligned_n >= 0.0, aligned_n * lift_range_rad, aligned_n * sink_range_rad)
     out[ANKLE_INDICES] = mapped * LIFT_DIR
     return out
 
@@ -67,13 +69,18 @@ def policy_action_to_exec_rad(
     asym_lift_range_rad: float,
     asym_sink_range_rad: float,
 ) -> np.ndarray:
+    """
+    Keep execution mapping identical to test_rwm_real_robot.py:
+    1) clip raw to [-1, 1]
+    2) apply per-dim action scale for all joints
+    3) apply optional asymmetric ankle mapping in rad space
+    """
     raw = np.asarray(action_raw_clipped, dtype=np.float32).copy()
     raw = np.clip(raw, -1.0, 1.0)
+    out = raw * np.asarray(action_scale_per_dim, dtype=np.float32)
     if use_asymmetric_ankle_mapping:
-        out = apply_asymmetric_ankle_mapping_from_raw(raw, asym_lift_range_rad, asym_sink_range_rad)
-        out[HIP_KNEE_INDICES] = raw[HIP_KNEE_INDICES] * np.asarray(action_scale_per_dim, dtype=np.float32)[HIP_KNEE_INDICES]
-        return out
-    return raw * np.asarray(action_scale_per_dim, dtype=np.float32)
+        out = apply_asymmetric_ankle_mapping_rad(out, asym_lift_range_rad, asym_sink_range_rad)
+    return out
 
 
 @dataclass

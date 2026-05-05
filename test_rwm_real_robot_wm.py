@@ -204,8 +204,8 @@ class EncoderInferenceWrapper(torch.nn.Module):
 USE_ASYMMETRIC_ANKLE_MAPPING = True
 # Ranges are in radians around the neutral (0) pose in sim joint space.
 # Positive direction means "lift" after alignment (left ankles: +, right ankles: -).
-ASYM_ANKLE_LIFT_RANGE_RAD = 1.0
-ASYM_ANKLE_SINK_RANGE_RAD = 0.10
+ASYM_ANKLE_LIFT_RANGE_RAD = 0.50#1.0
+ASYM_ANKLE_SINK_RANGE_RAD = 0.05#0.10
 
 
 def apply_asymmetric_ankle_mapping_rad(actions_rad, lift_range_rad=1.0, sink_range_rad=0.10):
@@ -3111,6 +3111,11 @@ def test_rwm_real_robot_wm(model_path):
                 step += 1
 
                 # 这里不再额外打印循环时间（交给 [Timing] 报告）
+
+        finished_by_max_steps = step >= max_steps
+        if finished_by_max_steps:
+            print("\nReached MAX_STEPS. Robot keeps holding the last pose (torque still enabled).")
+            input("Press Enter to end run and disable torque...")
 
         print("Control loop finished")
         print(f"Output files saved in: {output_dir}/")

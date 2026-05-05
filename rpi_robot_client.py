@@ -270,6 +270,8 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                         f"raw[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
                         f"risk={risk_state.level} contact_anomaly={int(contact_anomaly)} contact_steps={contact_steps}"
                     )
+            print("\n[RPI] Reached MAX_STEPS. Robot keeps holding last pose (torque still enabled).")
+            input("[RPI] Press Enter to finish and disable torque...")
     finally:
         try:
             servos.disable_torque(position_all)
