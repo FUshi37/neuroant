@@ -327,7 +327,10 @@ class PCRemoteDreamerServer:
         self.cfg = TrainConfig(
             device=args.device,
             train_every_steps=args.train_every_steps,
-            imagination_horizon=min(args.imagination_horizon, MAX_IMAGINATION_HORIZON),
+            imagination_horizon_min=args.h_min,
+            imagination_horizon_max=args.h_max,
+            n_imag_rollouts=args.n_imag,
+            gamma=args.gamma,
             policy_lr=args.policy_lr,
             grad_clip=args.grad_clip,
             dry_run=args.dry_run,
@@ -572,13 +575,12 @@ class PCRemoteDreamerServer:
             if rm:
                 reward_text = (
                     f" reward[real_total={rm.get('real_total', 0.0):.4f}, "
-                    f"upright={rm.get('real_upright', 0.0):.4f}, "
-                    f"ang={rm.get('real_ang_vel', 0.0):.4f}, "
-                    f"yaw_rate={rm.get('real_yaw_rate', 0.0):.4f}, "
+                    f"upright={rm.get('real_stability_gravity', 0.0):.4f}, "
+                    f"ang={rm.get('real_stability_ang_vel', 0.0):.4f}, "
                     f"yaw_head={rm.get('real_yaw_heading', 0.0):.4f}, "
                     f"cpg={rm.get('real_cpg', 0.0):.4f}, "
                     f"smooth={rm.get('real_smooth', 0.0):.4f}, "
-                    f"act={rm.get('real_action_l2', 0.0):.4f}, "
+                    f"imag_ret={rm.get('imag_discounted_return', 0.0):.4f}, "
                     f"imag_total={rm.get('imag_total', 0.0):.4f}]"
                 )
             print(
@@ -635,7 +637,12 @@ def parse_args():
         default=True,
         help="Disable torch.compile in the imported deployment helper.",
     )
-    parser.add_argument("--train-every-steps", type=int, default=5)
+    parser.add_argument(
+        "--train-every-steps",
+        type=int,
+        default=2,
+        help="Train every N real steps. Higher = cheaper and usually more stable.",
+    )
     parser.add_argument(
         "--online-train",
         action=argparse.BooleanOptionalAction,
@@ -648,7 +655,30 @@ def parse_args():
         default=500,
         help="Delay online gradient updates until control/network are stable.",
     )
-    parser.add_argument("--imagination-horizon", type=int, default=5)
+    parser.add_argument(
+        "--h-min",
+        type=int,
+        default=3,
+        help="Minimum imagination horizon (short horizon reduces model bias).",
+    )
+    parser.add_argument(
+        "--h-max",
+        type=int,
+        default=5,
+        help="Maximum imagination horizon (kept <=5 for real robot).",
+    )
+    parser.add_argument(
+        "--n-imag",
+        type=int,
+        default=5,
+        help="Number of short-horizon imagination rollouts per update.",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=0.97,
+        help="Discount factor for imagined short-horizon return.",
+    )
     parser.add_argument("--policy-lr", type=float, default=3e-4)
     parser.add_argument("--grad-clip", type=float, default=10.0)
     parser.add_argument("--action-limit", type=float, default=1.0)
@@ -670,9 +700,18 @@ def parse_args():
     )
     parser.add_argument("--log-every", type=int, default=50)
     args = parser.parse_args()
-    if args.imagination_horizon > MAX_IMAGINATION_HORIZON:
-        print("[PC] imagination horizon capped to 5")
-        args.imagination_horizon = MAX_IMAGINATION_HORIZON
+    args.h_min = max(1, int(args.h_min))
+    args.h_max = max(1, int(args.h_max))
+    if args.h_max > MAX_IMAGINATION_HORIZON:
+        print("[PC] h-max capped to 5 for real-robot stability")
+        args.h_max = MAX_IMAGINATION_HORIZON
+    if args.h_min > MAX_IMAGINATION_HORIZON:
+        print("[PC] h-min capped to 5 for real-robot stability")
+        args.h_min = MAX_IMAGINATION_HORIZON
+    if args.h_min > args.h_max:
+        print(f"[PC] h-min ({args.h_min}) > h-max ({args.h_max}), forcing h-min=h-max")
+        args.h_min = args.h_max
+    args.n_imag = max(1, int(args.n_imag))
     return args
 
 

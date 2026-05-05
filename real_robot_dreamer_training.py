@@ -22,14 +22,24 @@ OBS_DIM = 45
 ACTION_DIM = 18
 CONTROL_HZ = 50.0
 MAX_IMAGINATION_HORIZON = 5
+MIN_IMAGINATION_HORIZON = 3
+N_IMAG_DEFAULT = 5
+TRAIN_FREQ_DEFAULT = 2
+GAMMA_DEFAULT = 0.97
 
 
 @dataclass
 class TrainConfig:
     device: str = "cpu"
     control_hz: float = CONTROL_HZ
-    train_every_steps: int = 5
-    imagination_horizon: int = MAX_IMAGINATION_HORIZON
+    # Train every N real steps to balance compute budget and closed-loop stability.
+    train_every_steps: int = TRAIN_FREQ_DEFAULT
+    imagination_horizon_min: int = MIN_IMAGINATION_HORIZON
+    imagination_horizon_max: int = MAX_IMAGINATION_HORIZON
+    # Multiple short rollouts improve sample efficiency without long-horizon bias.
+    n_imag_rollouts: int = N_IMAG_DEFAULT
+    gamma: float = GAMMA_DEFAULT
+    imag_exploration_std: float = 0.05
     action_limit: float = 1.0
     policy_lr: float = 3e-4
     grad_clip: float = 10.0
@@ -285,7 +295,14 @@ def compute_reward_components(
     yaw: Optional[torch.Tensor] = None,
     yaw_target: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Return weighted reward terms for debugging real-robot behavior."""
+    """
+    Real-robot reward with short-horizon imagination compatibility.
+
+    Why this structure:
+    - Short horizons (3~5) keep imagined states close to the model's high-fidelity zone.
+    - Long horizons in real world accumulate model bias and can overfit policy to model errors.
+    - Multiple short rollouts recover efficiency by averaging more local training signals.
+    """
     obs = ensure_batch(obs)
     action = ensure_batch(action)
     prev_action = ensure_batch(prev_action)
@@ -293,39 +310,31 @@ def compute_reward_components(
 
     gravity = obs[..., 3:6].clamp(-2.0, 2.0)
     ang_vel = obs[..., 0:3].clamp(-8.0, 8.0)
-    roll_pitch_rate = ang_vel[..., 0:2]
-    yaw_rate = ang_vel[..., 2]
     joint_pos = obs[..., 9:27].clamp(-3.14, 3.14)
     action = action.clamp(-1.0, 1.0)
     prev_action = prev_action.clamp(-1.0, 1.0)
 
     gravity_target = torch.tensor([0.0, 0.0, -1.0], device=obs.device, dtype=obs.dtype)
-    # Use mean-square penalties instead of vector norms.  Norm penalties scale
-    # with dimension and are non-smooth at zero; squared means give smaller,
-    # steadier gradients and reduce action saturation on real hardware.
-    r_upright = -torch.mean((gravity - gravity_target) ** 2, dim=-1)
-    r_ang = -torch.mean(roll_pitch_rate**2, dim=-1)
-    # projected_gravity cannot observe absolute yaw.  Penalize yaw rate in both
-    # real and imagined states so the gait does not learn to spin in place.
-    r_yaw_rate = -(yaw_rate**2)
-    r_cpg = -torch.mean((joint_pos - cpg_target) ** 2, dim=-1)
-    r_smooth = -torch.mean((action - prev_action) ** 2, dim=-1)
-    r_action = -torch.mean(action**2, dim=-1)
+    # Keep the reward consistent with real-world stability priorities:
+    #   r_stability = -||g-[0,0,-1]|| - 0.3*||ang_vel||
+    #   r_cpg      = -||joint_pos-cpg||
+    #   r_smooth   = -||a_t-a_{t-1}||
+    r_upright = -torch.norm(gravity - gravity_target, dim=-1)
+    r_ang = -0.3 * torch.norm(ang_vel, dim=-1)
+    r_cpg = -torch.norm(joint_pos - cpg_target, dim=-1)
+    r_smooth = -torch.norm(action - prev_action, dim=-1)
     components = {
-        "upright": 2.0 * r_upright,
-        "ang_vel": 0.05 * r_ang,
-        "yaw_rate": 0.15 * r_yaw_rate,
+        "stability_gravity": r_upright,
+        "stability_ang_vel": r_ang,
         "cpg": 0.5 * r_cpg,
-        "smooth": 0.2 * r_smooth,
-        "action_l2": 0.05 * r_action,
+        "smooth": 0.1 * r_smooth,
     }
     if yaw is not None and yaw_target is not None:
         yaw = ensure_batch(yaw.reshape(-1, 1)).squeeze(-1).to(obs.device, dtype=obs.dtype)
         yaw_target = ensure_batch(yaw_target.reshape(-1, 1)).squeeze(-1).to(obs.device, dtype=obs.dtype)
-        # Absolute yaw is available only from real IMU metadata, not from the
-        # WM prop decoder.  It anchors each battery/run to its initial heading.
+        # Optional small heading anchor from real IMU metadata.
         yaw_error = wrap_to_pi(yaw - yaw_target)
-        components["yaw_heading"] = -0.8 * yaw_error**2
+        components["yaw_heading"] = -0.05 * yaw_error**2
     components["total"] = sum(components.values())
     return components
 
@@ -442,6 +451,61 @@ def freeze_module(module: nn.Module) -> None:
         param.requires_grad_(False)
 
 
+def clone_latent(latent: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {k: v.clone() for k, v in latent.items()}
+
+
+def compute_discounted_return(rewards: torch.Tensor, gamma: float = GAMMA_DEFAULT) -> torch.Tensor:
+    """
+    Compute discounted multi-step return from one short imagined trajectory.
+
+    Why this improves efficiency:
+    - Uses reward signal from every imagined step, not only the final step.
+    - In real-robot world models, earlier imagined steps are usually more reliable.
+    """
+    rewards = rewards.reshape(-1)
+    returns = torch.zeros(1, device=rewards.device, dtype=rewards.dtype).squeeze(0)
+    for t, r in enumerate(rewards):
+        returns = returns + (gamma ** t) * r
+    return returns
+
+
+def compute_stepwise_loss(rewards: torch.Tensor, gamma: float = GAMMA_DEFAULT) -> torch.Tensor:
+    """
+    Per-step supervision over one trajectory.
+
+    Why discounting is necessary:
+    - Later imagined states carry larger model bias in real deployment.
+    - Discounting preserves learning from all steps while down-weighting less
+      reliable late-step rewards.
+    """
+    rewards = rewards.reshape(-1)
+    losses: List[torch.Tensor] = []
+    for t in range(rewards.shape[0]):
+        weighted_r = (gamma ** t) * rewards[t]
+        losses.append(-weighted_r)
+    return torch.stack(losses).mean()
+
+
+def utilize_trajectory(
+    rewards: torch.Tensor,
+    gamma: float = GAMMA_DEFAULT,
+    step_loss_coef: float = 0.5,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Reuse a single imagined trajectory for multiple training signals.
+
+    One trajectory contributes to:
+    1) discounted return objective
+    2) per-step supervision objective
+    """
+    discounted_return = compute_discounted_return(rewards, gamma=gamma)
+    return_loss = -discounted_return
+    step_loss = compute_stepwise_loss(rewards, gamma=gamma)
+    total_loss = return_loss + float(step_loss_coef) * step_loss
+    return total_loss, discounted_return, step_loss
+
+
 def imagination_rollout(
     world_model: nn.Module,
     policy: nn.Module,
@@ -449,10 +513,14 @@ def imagination_rollout(
     horizon: int,
     cpg_targets: torch.Tensor,
     prev_action: torch.Tensor,
-) -> Tuple[List[torch.Tensor], Dict[str, torch.Tensor]]:
+    action_limit: float,
+    imag_exploration_std: float,
+    gamma: float,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Short imagination only.  On a real robot, long imagination quickly compounds
-    model error and can push the policy toward unsafe actions.
+    Short imagination only.
+    Real-robot note: long imagination compounds model bias and can optimize
+    policy toward decoder/dynamics artifacts instead of true hardware behavior.
     """
     horizon = min(int(horizon), MAX_IMAGINATION_HORIZON)
     rewards: List[torch.Tensor] = []
@@ -461,7 +529,12 @@ def imagination_rollout(
 
     for t in range(horizon):
         feat = world_model.dynamics.get_feat(latent)
-        action = soft_action_limit(policy.actor(feat), 1.0)
+        action = policy.actor(feat)
+        # Small noise diversifies short rollouts and improves sample efficiency
+        # without relying on long-horizon imagination (which is biased on real robots).
+        if imag_exploration_std > 0.0:
+            action = action + imag_exploration_std * torch.randn_like(action)
+        action = soft_action_limit(action, action_limit)
         latent = world_model.dynamics.img_step(latent, action, sample=True)
         feat_next = world_model.dynamics.get_feat(latent)
         pred = world_model.heads["decoder"](feat_next)
@@ -478,7 +551,70 @@ def imagination_rollout(
         name: torch.stack(values).mean()
         for name, values in component_history.items()
     }
-    return rewards, component_means
+    rewards_tensor = torch.stack(rewards)
+    discounted_return = compute_discounted_return(rewards_tensor.mean(dim=-1), gamma=gamma)
+    component_means["discounted_return"] = discounted_return.mean()
+    return rewards_tensor, component_means
+
+
+def imagination_multi_rollout(
+    world_model: nn.Module,
+    policy: nn.Module,
+    latent: Dict[str, torch.Tensor],
+    prev_action: torch.Tensor,
+    cfg: TrainConfig,
+    global_step: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    Multiple short rollouts are used instead of one long rollout.
+    This improves sample efficiency (more imagined branches per real step)
+    while keeping per-branch model bias low.
+    """
+    component_history: Dict[str, List[torch.Tensor]] = {}
+    all_losses: List[torch.Tensor] = []
+    all_step_losses: List[torch.Tensor] = []
+
+    h_min = max(1, int(cfg.imagination_horizon_min))
+    h_max = min(MAX_IMAGINATION_HORIZON, int(cfg.imagination_horizon_max))
+    if h_min > h_max:
+        h_min = h_max
+
+    for i in range(max(1, int(cfg.n_imag_rollouts))):
+        horizon = int(torch.randint(h_min, h_max + 1, (1,), device=device).item())
+        cpg_targets = get_cpg_targets(horizon, device, step=global_step + i)
+        rewards_tensor, rollout_components = imagination_rollout(
+            world_model=world_model,
+            policy=policy,
+            latent=clone_latent(latent),
+            horizon=horizon,
+            cpg_targets=cpg_targets,
+            prev_action=prev_action,
+            action_limit=cfg.action_limit,
+            imag_exploration_std=cfg.imag_exploration_std,
+            gamma=cfg.gamma,
+        )
+        # Reuse one short trajectory for multiple objectives instead of extending horizon.
+        rollout_loss, discounted_return, step_loss = utilize_trajectory(
+            rewards=rewards_tensor.mean(dim=-1),
+            gamma=cfg.gamma,
+            step_loss_coef=0.5,
+        )
+        all_losses.append(rollout_loss)
+        all_step_losses.append(step_loss)
+        for name, value in rollout_components.items():
+            component_history.setdefault(name, []).append(value)
+        component_history.setdefault("discounted_return_reuse", []).append(discounted_return)
+        component_history.setdefault("step_loss", []).append(step_loss)
+
+    component_means = {
+        name: torch.stack(values).mean()
+        for name, values in component_history.items()
+    }
+    losses_tensor = torch.stack(all_losses)
+    step_losses_tensor = torch.stack(all_step_losses)
+    component_means["step_loss"] = step_losses_tensor.mean()
+    return losses_tensor.mean(), component_means
 
 
 def estimate_anomaly(
@@ -538,8 +674,8 @@ def train_step(
     for param in world_model.parameters():
         param.requires_grad_(False)
 
-    horizon = min(cfg.imagination_horizon, MAX_IMAGINATION_HORIZON)
-    cpg_targets = get_cpg_targets(horizon, obs.device, global_step)
+    real_horizon = min(MAX_IMAGINATION_HORIZON, max(1, int(cfg.imagination_horizon_min)))
+    cpg_targets = get_cpg_targets(real_horizon, obs.device, global_step)
 
     feat = world_model.dynamics.get_feat(latent_post)
     action_now = soft_action_limit(policy(obs, None, feat.detach()), cfg.action_limit)
@@ -553,16 +689,18 @@ def train_step(
     )
     real_reward = real_components["total"]
 
-    imag_rewards, imag_components = imagination_rollout(
+    imag_loss, imag_components = imagination_multi_rollout(
         world_model,
         policy,
         latent_post,
-        horizon=horizon,
-        cpg_targets=cpg_targets,
         prev_action=prev_action,
+        cfg=cfg,
+        global_step=global_step,
+        device=obs.device,
     )
-    imag_reward = torch.stack(imag_rewards).mean()
-    loss = -(real_reward.mean() + imag_reward)
+    # Keep real-step supervision, and add multi-use imagined trajectory loss.
+    # Short horizon (3~5) is critical on real robots to control world-model bias.
+    loss = -real_reward.mean() + imag_loss
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -693,10 +831,10 @@ class RealRobotDreamerTrainer:
                         f"step={self.global_step} loss={loss:.4f} "
                         f"real_total={reward_metrics['real_total']:.4f} "
                         f"imag_total={reward_metrics['imag_total']:.4f} "
-                        f"upright={reward_metrics['real_upright']:.4f} "
+                        f"upright={reward_metrics['real_stability_gravity']:.4f} "
                         f"cpg={reward_metrics['real_cpg']:.4f} "
                         f"smooth={reward_metrics['real_smooth']:.4f} "
-                        f"action_l2={reward_metrics['real_action_l2']:.4f}"
+                        f"ang={reward_metrics['real_stability_ang_vel']:.4f}"
                     )
             else:
                 with torch.no_grad():
@@ -764,22 +902,36 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--real", action="store_true", help="Use real hardware adapter.")
     parser.add_argument("--control-hz", type=float, default=CONTROL_HZ)
-    parser.add_argument("--train-every-steps", type=int, default=5)
-    parser.add_argument("--imagination-horizon", type=int, default=MAX_IMAGINATION_HORIZON)
+    parser.add_argument("--train-every-steps", type=int, default=TRAIN_FREQ_DEFAULT, help="Policy update frequency.")
+    parser.add_argument("--h-min", type=int, default=MIN_IMAGINATION_HORIZON, help="Min short horizon.")
+    parser.add_argument("--h-max", type=int, default=MAX_IMAGINATION_HORIZON, help="Max short horizon (<=5).")
+    parser.add_argument("--n-imag", type=int, default=N_IMAG_DEFAULT, help="Number of short imagination rollouts.")
+    parser.add_argument("--gamma", type=float, default=GAMMA_DEFAULT, help="Discount factor for imagined return.")
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--battery-voltage-threshold", type=float, default=11.0)
     parser.add_argument("--battery-max-steps", type=int, default=4000)
     args = parser.parse_args()
 
-    horizon = min(int(args.imagination_horizon), MAX_IMAGINATION_HORIZON)
-    if args.imagination_horizon > MAX_IMAGINATION_HORIZON:
-        print("Warning: imagination horizon capped at 5 for real-robot safety.")
+    h_min = max(1, int(args.h_min))
+    h_max = max(1, int(args.h_max))
+    if h_max > MAX_IMAGINATION_HORIZON:
+        print("Warning: h-max capped at 5 for real-robot safety.")
+        h_max = MAX_IMAGINATION_HORIZON
+    if h_min > MAX_IMAGINATION_HORIZON:
+        print("Warning: h-min capped at 5 for real-robot safety.")
+        h_min = MAX_IMAGINATION_HORIZON
+    if h_min > h_max:
+        print(f"Warning: h-min ({h_min}) > h-max ({h_max}); forcing h-min = h-max.")
+        h_min = h_max
 
     return TrainConfig(
         device=args.device,
         control_hz=args.control_hz,
         train_every_steps=args.train_every_steps,
-        imagination_horizon=horizon,
+        imagination_horizon_min=h_min,
+        imagination_horizon_max=h_max,
+        n_imag_rollouts=max(1, int(args.n_imag)),
+        gamma=float(args.gamma),
         max_steps=args.max_steps,
         dry_run=not args.real,
         battery_voltage_threshold=args.battery_voltage_threshold,
