@@ -28,6 +28,9 @@ from multiprocessing import Process, Queue
 # Import RWM model components
 from world_model.actor_cirtic_rwm import ActorCriticRWM
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+VALIDATION_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "validation_outputs")
+
 
 # ==================== PORT ERROR DETECTION ====================
 class PortErrorDetector:
@@ -69,7 +72,7 @@ sys.stdout = port_detector
 
 INTERPOLATION_STEPS = 1 # Simplified: no interpolation like CPGs
 TARGET_DT = 0.02  # 20ms = 50Hz like CPGs for higher control frequency
-MAX_STEPS = 2000
+MAX_STEPS = 1000
 # 策略输出逐维缩放（与 action 索引一致）：
 # [0:3] l1_bc,l1_cf,l1_ft  [3:6] l2  [6:9] l3  [9:12] r1  [12:15] r2  [15:18] r3
 ACTION_SCALE_PER_DIM = np.array(
@@ -1064,6 +1067,8 @@ class ContactAnomalyDetector:
         self.ema_error = None
         self.anomaly_counter = 0
         self._rssm_action_dim = self._infer_rssm_action_dim()
+        self.last_obs_real = None
+        self.last_obs_pred = None
 
     def _infer_rssm_action_dim(self):
         dynamics = getattr(self.world_model, "dynamics", None)
@@ -1173,6 +1178,10 @@ class ContactAnomalyDetector:
         """
         obs_real = obs_dict["prop"].to(self.device, dtype=torch.float32)
         obs_pred, latent_post = self.predict_next_obs(prev_latent, action, obs_dict)
+        # Cache current real/predicted observations so runtime correction can
+        # localize which leg contributed most to the prediction mismatch.
+        self.last_obs_real = obs_real.detach()
+        self.last_obs_pred = obs_pred.detach()
         error = self.compute_error(obs_real, obs_pred)
 
         if self.ema_error is None:
@@ -1190,6 +1199,75 @@ class ContactAnomalyDetector:
             self.anomaly_counter = 0
         is_anomaly = self.anomaly_counter >= self.trigger_count
         return is_anomaly, self.ema_error, latent_post, self.anomaly_counter
+
+
+def compute_leg_errors(obs_real, obs_pred):
+    """
+    Compute per-leg joint prediction errors from observation joint slice [9:27].
+
+    Why this works:
+    - In normal contact, WM prior and real joint states stay close.
+    - A stuck leg typically shows a larger mismatch in its 3 joints because
+      commanded motion is blocked by unexpected contact.
+    """
+    joint_real = obs_real[..., 9:27]
+    joint_pred = obs_pred[..., 9:27]
+    leg_errors = []
+    for i in range(6):
+        idx = slice(i * 3, (i + 1) * 3)
+        err = torch.norm(joint_real[..., idx] - joint_pred[..., idx], dim=-1)
+        leg_errors.append(err)
+    return torch.stack(leg_errors, dim=0)
+
+
+def detect_stuck_leg(leg_errors, threshold=0.15):
+    """
+    Select the leg with maximum prediction mismatch if it exceeds threshold.
+    """
+    max_err, leg_id = torch.max(leg_errors, dim=0)
+    if bool(max_err > threshold):
+        return int(leg_id.item())
+    return None
+
+
+class LegLiftController:
+    """
+    Runtime one-leg lift override.
+
+    Why short lift is enough here:
+    - Obstacles are low-height and usually require only brief clearance.
+    - Keeping lift short (3~5 control steps) avoids oscillation and quickly
+      hands control back to the policy.
+    """
+
+    def __init__(self, lift_steps=4):
+        self.active = False
+        self.leg_id = None
+        self.counter = 0
+        self.lift_steps = int(lift_steps)
+
+    def trigger(self, leg_id):
+        self.active = True
+        self.leg_id = int(leg_id)
+        self.counter = 0
+
+    def apply(self, action):
+        if not self.active:
+            return action
+
+        corrected = action.clone()
+        base = self.leg_id * 3
+        knee = base + 1
+        ankle = base + 2
+        corrected[..., knee] = corrected[..., knee] - 0.25
+        corrected[..., ankle] = corrected[..., ankle] + 0.25
+
+        self.counter += 1
+        if self.counter >= self.lift_steps:
+            self.active = False
+            self.leg_id = None
+            self.counter = 0
+        return corrected
 
 
 def adjust_action(
@@ -2181,7 +2259,7 @@ def run_imu_test_only():
         raise
 
     # 可选：写 IMU 测试日志
-    output_dir = "validation_outputs"
+    output_dir = VALIDATION_OUTPUT_DIR
     os.makedirs(output_dir, exist_ok=True)
     imu_test_file = os.path.join(output_dir, "imu_test_axes.txt")
     f_log = open(imu_test_file, 'w')
@@ -2337,7 +2415,7 @@ def run_replay_sim_dof(sim_data_path=None):
         raise
 
     angle_limits = ROBOT_CONFIG['angle_limits']
-    output_dir = "validation_outputs"
+    output_dir = VALIDATION_OUTPUT_DIR
     os.makedirs(output_dir, exist_ok=True)
     actions_file = os.path.join(output_dir, "actions_output.txt")
     observations_file = os.path.join(output_dir, "observations_output.txt")
@@ -2443,6 +2521,7 @@ def test_rwm_real_robot_wm(model_path):
     detector_last_error = None
     detector_last_anomaly = False
     detector_last_steps = 0
+    lift_controller = LegLiftController(lift_steps=4)
 
     # Initialize real robot components
     print("📍 Step 1: Initializing Servos...")
@@ -2541,7 +2620,7 @@ def test_rwm_real_robot_wm(model_path):
         raise
     
     # 保存initialize角度到文件
-    with open('./validation_outputs/initialize_angles_test_rwm_real_robot.txt', 'a') as f:
+    with open(os.path.join(VALIDATION_OUTPUT_DIR, 'initialize_angles_test_rwm_real_robot.txt'), 'a') as f:
         f.write(str(real_angles) + '\n')
 
     # Initialize trajectory history for policy input
@@ -2579,7 +2658,7 @@ def test_rwm_real_robot_wm(model_path):
     previous_actions = None
 
     # Initialize output files for validation
-    output_dir = "validation_outputs"
+    output_dir = VALIDATION_OUTPUT_DIR
     os.makedirs(output_dir, exist_ok=True)
 
     actions_file = os.path.join(output_dir, "actions_output.txt")
@@ -2692,7 +2771,7 @@ def test_rwm_real_robot_wm(model_path):
                 # 保存observation到文件中
                 #with open('./validation_outputs/proprioceptive_obs_test_rwm_real_robot.txt', 'a') as f:
                 #    f.write(str(proprioceptive_obs) + '\n')
-                with open('./validation_outputs/real_obs_test_rwm_real_robot.txt', 'a') as f:
+                with open(os.path.join(VALIDATION_OUTPUT_DIR, 'real_obs_test_rwm_real_robot.txt'), 'a') as f:
                     f.write(str(real_obs) + '\n')
 
                 # Prepare observation dict for world model（复用 prop buffer）
@@ -2753,14 +2832,29 @@ def test_rwm_real_robot_wm(model_path):
                             action=action_nominal,
                             obs_dict=obs_dict,
                         )
-                        actions = adjust_action(
-                            actions,
-                            detector_last_anomaly,
-                            detector_last_steps,
-                            base_scale=CONTACT_ANOMALY_ACTION_SCALE,
-                            lift_gain=CONTACT_ANOMALY_LIFT_GAIN,
-                            max_lift_gain=CONTACT_ANOMALY_MAX_LIFT_GAIN,
-                        )
+                        # When anomaly is flagged, locate the most likely stuck leg
+                        # from per-leg joint prediction errors, then trigger a short
+                        # single-leg lift override.
+                        if detector_last_anomaly and (not lift_controller.active):
+                            obs_real_for_leg = contact_detector.last_obs_real
+                            obs_pred_for_leg = contact_detector.last_obs_pred
+                            if (obs_real_for_leg is not None) and (obs_pred_for_leg is not None):
+                                leg_errors = compute_leg_errors(obs_real_for_leg, obs_pred_for_leg)
+                                bad_leg = detect_stuck_leg(
+                                    leg_errors,
+                                    threshold=CONTACT_ANOMALY_THRESHOLD,
+                                )
+                                if bad_leg is not None:
+                                    leg_err_vec = leg_errors.detach().cpu().squeeze(-1).numpy()
+                                    max_err = float(np.max(leg_err_vec))
+                                    print(
+                                        f"[LegAnomaly] step={step} bad_leg={bad_leg} "
+                                        f"max_err={max_err:.4f} leg_errors={np.array2string(leg_err_vec, precision=4)}"
+                                    )
+                                    lift_controller.trigger(bad_leg)
+                # Apply temporary one-leg lift override and automatically return
+                # control to policy after lift_steps.
+                actions = lift_controller.apply(actions)
                 #print("actions: ", actions)
 
                 # For obs_without_command (next step): use clip-only, before scale and before asymmetric mapping (align with sim)
@@ -2868,9 +2962,9 @@ def test_rwm_real_robot_wm(model_path):
                     print(f"\n❌ ERROR at Step {step} - Writing positions: {e}")
                     raise  # Re-raise to stop immediately
                 # 将real_angles和ticks写入文件
-                with open('./validation_outputs/real_angles_test_rwm_real_robot.txt', 'a') as f:
+                with open(os.path.join(VALIDATION_OUTPUT_DIR, 'real_angles_test_rwm_real_robot.txt'), 'a') as f:
                     f.write(str(real_angles) + '\n')
-                with open('./validation_outputs/ticks_test_rwm_real_robot.txt', 'a') as f:
+                with open(os.path.join(VALIDATION_OUTPUT_DIR, 'ticks_test_rwm_real_robot.txt'), 'a') as f:
                     f.write(str(ticks) + '\n')
                 
                 ## Log actions (BEFORE sending to servos) - using limited actions
