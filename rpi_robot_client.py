@@ -143,7 +143,8 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                     "step", "raw_action_min", "raw_action_max", "raw_action_mean",
                     "exec_action_min", "exec_action_max", "exec_action_mean",
                     "risk_level", "wm_error", "contact_error", "contact_anomaly", "contact_steps",
-                    "bad_leg", "candidate_selected", "candidate_group", "candidate_score", "max_delta_before_filter",
+                    "detected_bad_leg", "bad_leg", "candidate_selected", "candidate_group", "candidate_score",
+                    "forced_lift", "max_delta_before_filter",
                     "max_delta_after_filter", "ankle_delta_max",
                 ],
             )
@@ -255,10 +256,12 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                         "contact_error": float(contact_error),
                         "contact_anomaly": int(contact_anomaly),
                         "contact_steps": int(contact_steps),
+                        "detected_bad_leg": int(resp.get("detected_bad_leg", -1)),
                         "bad_leg": int(resp.get("bad_leg", -1)),
                         "candidate_selected": str(resp.get("candidate_selected", "nominal")),
                         "candidate_group": str(resp.get("candidate_group", "")),
                         "candidate_score": float(resp.get("candidate_score", 0.0)),
+                        "forced_lift": int(bool(resp.get("forced_lift", False))),
                         "max_delta_before_filter": safety_dbg.get("max_delta_before_filter", 0.0),
                         "max_delta_after_filter": safety_dbg.get("max_delta_after_filter", 0.0),
                         "ankle_delta_max": safety_dbg.get("ankle_delta_max", 0.0),
@@ -271,6 +274,7 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
 
                 candidate_selected = str(resp.get("candidate_selected", "nominal"))
                 candidate_group = str(resp.get("candidate_group", ""))
+                detected_bad_leg = int(resp.get("detected_bad_leg", -1))
                 bad_leg = int(resp.get("bad_leg", -1))
                 event_key = (int(risk_level), int(contact_anomaly), bad_leg, candidate_selected)
                 event_active = (
@@ -286,7 +290,9 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                         f"net_ok={net_ok_count} fallback={net_fallback_count} "
                         f"raw[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
                         f"risk={risk_level} contact_anomaly={int(contact_anomaly)} contact_steps={contact_steps} "
-                        f"bad_leg={bad_leg} cand={candidate_selected} group={candidate_group} "
+                        f"det_bad_leg={detected_bad_leg} bad_leg={bad_leg} "
+                        f"cand={candidate_selected} group={candidate_group} "
+                        f"forced_lift={int(bool(resp.get('forced_lift', False)))} "
                         f"err={contact_error:.4f} ema={risk_ema:.4f} "
                         f"dq_raw={np.degrees(float(safety_dbg.get('max_delta_before_filter', 0.0))):.2f}deg "
                         f"dq_exec={np.degrees(float(safety_dbg.get('max_delta_after_filter', 0.0))):.2f}deg"

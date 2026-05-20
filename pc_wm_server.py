@@ -25,7 +25,7 @@ from test_rwm_real_robot_wm import (
     compute_leg_errors,
     detect_stuck_leg,
 )
-from deployment_safety import RiskLevelEstimator, WorldModelCandidateSelector
+from deployment_safety import BadLegTracker, RiskLevelEstimator, WorldModelCandidateSelector
 
 
 def _to_float_list(arr):
@@ -38,7 +38,7 @@ def run_server(
     model_path,
     remove_dof_vel=False,
     log_every=50,
-    use_stability_filter=False,
+    use_stability_filter=True,
     filter_debug_path=None,
     log_contact_anomaly=True,
 ):
@@ -70,6 +70,11 @@ def run_server(
     )
     detector_latent = inference.wm_latent
     risk_estimator = RiskLevelEstimator()
+    bad_leg_tracker = BadLegTracker()
+    if candidate_selector is None:
+        print("[PC][WARNING] WM candidate selector is DISABLED. Risk can only tighten the final rate limiter; no lift candidates will be selected.")
+    else:
+        print("[PC] WM candidate selector ENABLED: risk-coupled candidates and lift recovery are active.")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((host, port))
@@ -91,7 +96,9 @@ def run_server(
             "num_candidates",
             "risk_level",
             "risk_ema",
+            "detected_bad_leg",
             "bad_leg",
+            "forced_lift",
             "horizon",
             "server_ms",
             "action_min",
@@ -134,7 +141,7 @@ def run_server(
                 with torch.no_grad():
                     wm_feature = inference.update_world_model(obs_dict, prev_action)
                     actions = policy(obs_dict["prop"], history_t, wm_feature)
-                    bad_leg = None
+                    detected_bad_leg = None
                     if contact_detector is not None:
                         if detector_latent is None:
                             detector_latent = inference.wm_latent
@@ -169,13 +176,17 @@ def run_server(
                         obs_pred_for_leg = contact_detector.last_obs_pred
                         if (obs_real_for_leg is not None) and (obs_pred_for_leg is not None):
                             leg_errors = compute_leg_errors(obs_real_for_leg, obs_pred_for_leg)
-                            bad_leg = detect_stuck_leg(leg_errors, threshold=CONTACT_ANOMALY_THRESHOLD)
+                            detected_bad_leg = detect_stuck_leg(leg_errors, threshold=CONTACT_ANOMALY_THRESHOLD)
+                    stable_bad_leg = bad_leg_tracker.update(
+                        detected_bad_leg,
+                        active=int(anomaly_debug.get("steps", 0)) >= 1,
+                    )
 
                     risk_state = risk_estimator.update(
                         wm_error=float(anomaly_debug.get("error")) if isinstance(anomaly_debug.get("error"), (float, int)) else 0.0,
                         contact_anomaly=bool(anomaly_debug.get("is_anomaly", False)),
                         contact_steps=int(anomaly_debug.get("steps", 0)),
-                        bad_leg=bad_leg,
+                        bad_leg=stable_bad_leg,
                     )
 
                     if candidate_selector is not None and inference.wm_latent is not None:
@@ -215,10 +226,12 @@ def run_server(
                     "risk_ema": float(risk_state.ema_error),
                     "risk_baseline_mean": float(risk_state.baseline_mean),
                     "risk_baseline_std": float(risk_state.baseline_std),
+                    "detected_bad_leg": int(-1 if detected_bad_leg is None else detected_bad_leg),
                     "bad_leg": int(risk_state.bad_leg),
                     "candidate_selected": str(filter_debug.get("selected", "nominal")),
                     "candidate_group": str(filter_debug.get("selected_group", "")),
                     "candidate_score": float(filter_debug.get("score", 0.0)) if isinstance(filter_debug.get("score", 0.0), (float, int)) else 0.0,
+                    "forced_lift": bool(filter_debug.get("forced_lift", False)),
                 }
                 packet_count += 1
 
@@ -232,7 +245,9 @@ def run_server(
                     "num_candidates": filter_debug.get("num_candidates", ""),
                     "risk_level": int(risk_state.level),
                     "risk_ema": float(risk_state.ema_error),
+                    "detected_bad_leg": int(-1 if detected_bad_leg is None else detected_bad_leg),
                     "bad_leg": int(risk_state.bad_leg),
+                    "forced_lift": int(bool(filter_debug.get("forced_lift", False))),
                     "horizon": 4,
                     "server_ms": server_ms,
                     "action_min": float(action_raw.min()),
@@ -266,12 +281,13 @@ def run_server(
                         f"act[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
                         f"server={server_ms:.2f}ms "
                         f"filter_used={row['filter_used']} cand={row['candidate_selected']} "
-                        f"group={row['candidate_group']} score={row['candidate_score']} "
+                        f"group={row['candidate_group']} forced_lift={row['forced_lift']} score={row['candidate_score']} "
                         f"risk={risk_state.level} "
                         f"contact_enabled={int(anomaly_debug['enabled'])} "
                         f"contact_anomaly={int(anomaly_debug['is_anomaly'])} "
                         f"contact_error={anomaly_debug['error']} "
                         f"contact_steps={anomaly_debug['steps']} "
+                        f"det_bad_leg={-1 if detected_bad_leg is None else detected_bad_leg} "
                         f"bad_leg={risk_state.bad_leg}"
                     )
             except Exception as e:
@@ -297,7 +313,8 @@ def main():
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--remove-dof-vel", action="store_true")
     parser.add_argument("--log-every", type=int, default=50)
-    parser.add_argument("--use-stability-filter", action="store_true")
+    parser.add_argument("--use-stability-filter", dest="use_stability_filter", action="store_true", default=True)
+    parser.add_argument("--disable-stability-filter", dest="use_stability_filter", action="store_false")
     parser.add_argument("--filter-debug-path", default=None)
     parser.add_argument("--no-contact-anomaly-log", action="store_true")
     args = parser.parse_args()

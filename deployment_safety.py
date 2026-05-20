@@ -40,6 +40,8 @@ RISK_BASELINE_WARMUP_STEPS = 80
 RISK_K_SIGMA = 2.5
 RISK_FIXED_LEVEL1_THRESHOLD = 0.12
 RISK_FIXED_LEVEL2_THRESHOLD = 0.22
+BAD_LEG_TRACK_DECAY = 0.72
+BAD_LEG_TRACK_HOLD_STEPS = 8
 
 
 def default_action_scale_per_dim() -> np.ndarray:
@@ -142,6 +144,34 @@ class RiskLevelEstimator:
         )
 
 
+class BadLegTracker:
+    def __init__(self, decay: float = BAD_LEG_TRACK_DECAY, hold_steps: int = BAD_LEG_TRACK_HOLD_STEPS):
+        self.decay = float(decay)
+        self.hold_steps = int(max(1, hold_steps))
+        self.scores = np.zeros(6, dtype=np.float32)
+        self.current = -1
+        self.hold = 0
+
+    def reset(self):
+        self.scores[:] = 0.0
+        self.current = -1
+        self.hold = 0
+
+    def update(self, detected_leg: Optional[int], active: bool) -> int:
+        self.scores *= self.decay
+        leg = -1 if detected_leg is None else int(detected_leg)
+        if active and 0 <= leg < 6:
+            self.scores[leg] += 1.0
+            best = int(np.argmax(self.scores))
+            self.current = best
+            self.hold = self.hold_steps
+        elif self.hold > 0:
+            self.hold -= 1
+        else:
+            self.current = -1
+        return int(self.current)
+
+
 class SafetyActionFilter:
     def __init__(self, action_limits: Dict[str, np.ndarray]):
         self.action_limits = action_limits
@@ -217,6 +247,7 @@ class WorldModelCandidateSelector:
         self.max_lift_candidates = int(max(0, min(6, max_lift_candidates)))
         self.device = torch.device(device)
         self.last_debug = {}
+        self._select_count = 0
 
     @staticmethod
     def _risk_level(risk_state: Optional[RiskState]) -> int:
@@ -336,6 +367,7 @@ class WorldModelCandidateSelector:
                 return torch.clamp(action_nominal, -1.0, 1.0)
             nominal = torch.clamp(self._ensure_2d(action_nominal).to(self.device, dtype=torch.float32), -1.0, 1.0)
             prev = None if prev_action is None else torch.clamp(self._ensure_2d(prev_action).to(self.device, dtype=torch.float32), -1.0, 1.0)
+            self._select_count += 1
             risk_level = self._risk_level(risk_state)
             bad_leg = self._bad_leg(risk_state)
             candidates = self._build_candidates(nominal, prev, risk_state)
@@ -384,19 +416,35 @@ class WorldModelCandidateSelector:
                 bias = torch.zeros(n, device=self.device, dtype=score.dtype)
                 for idx, name in enumerate(names):
                     if name == "nominal":
-                        bias[idx] += 0.03 * float(risk_level)
+                        bias[idx] += 0.15 * float(risk_level)
                     if name.startswith("lift_leg_"):
                         try:
                             leg_id = int(name.rsplit("_", 1)[-1])
                         except Exception:
                             leg_id = -1
                         if bad_leg >= 0 and leg_id == bad_leg:
-                            bias[idx] -= 0.05 * float(risk_level)
+                            bias[idx] -= 0.45 * float(risk_level)
                         elif bad_leg >= 0:
-                            bias[idx] += 0.03 * float(risk_level)
+                            bias[idx] += 0.08 * float(risk_level)
                 score = score + bias
 
-            best_idx = int(torch.argmin(score).detach().cpu().item())
+            forced_lift = False
+            forced_lift_name = ""
+            if (
+                self._select_count >= 20
+                and risk_level >= 2
+                and bad_leg >= 0
+                and int(getattr(risk_state, "contact_steps", 0)) >= 3
+            ):
+                target_name = f"lift_leg_{bad_leg}"
+                if target_name in names:
+                    best_idx = int(names.index(target_name))
+                    forced_lift = True
+                    forced_lift_name = target_name
+                else:
+                    best_idx = int(torch.argmin(score).detach().cpu().item())
+            else:
+                best_idx = int(torch.argmin(score).detach().cpu().item())
             self.last_debug = {
                 "selected": names[best_idx],
                 "selected_group": self._candidate_group(names[best_idx]),
@@ -406,6 +454,9 @@ class WorldModelCandidateSelector:
                 "used": bool(best_idx != 0),
                 "risk_level": int(risk_level),
                 "bad_leg": int(bad_leg),
+                "forced_lift": bool(forced_lift),
+                "forced_lift_name": forced_lift_name,
+                "select_count": int(self._select_count),
                 "ankle_weight": float(ankle_weight),
                 "down_weight": float(down_weight),
             }

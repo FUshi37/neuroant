@@ -30,6 +30,7 @@ from multiprocessing import Process, Queue
 from world_model.actor_cirtic_rwm import ActorCriticRWM
 from deployment_safety import (
     RiskLevelEstimator,
+    BadLegTracker,
     SafetyActionFilter,
     WorldModelCandidateSelector,
     default_action_scale_per_dim,
@@ -2525,6 +2526,7 @@ def test_rwm_real_robot_wm(model_path):
     detector_last_steps = 0
     lift_controller = LegLiftController(lift_steps=4)
     risk_estimator = RiskLevelEstimator()
+    bad_leg_tracker = BadLegTracker()
 
     # Initialize real robot components
     print("📍 Step 1: Initializing Servos...")
@@ -2731,7 +2733,8 @@ def test_rwm_real_robot_wm(model_path):
                     "step", "raw_action_min", "raw_action_max", "raw_action_mean",
                     "exec_action_min", "exec_action_max", "exec_action_mean",
                     "risk_level", "wm_error", "contact_error", "contact_anomaly", "contact_steps",
-                    "bad_leg", "candidate_selected", "candidate_group", "candidate_score", "max_delta_before_filter",
+                    "detected_bad_leg", "bad_leg", "candidate_selected", "candidate_group", "candidate_score",
+                    "forced_lift", "max_delta_before_filter",
                     "max_delta_after_filter", "ankle_delta_max",
                 ],
             )
@@ -2830,7 +2833,7 @@ def test_rwm_real_robot_wm(model_path):
                 #print("wm_feature: ", wm_feature)
                 action_nominal = policy(obs_dict["prop"], history_tensor, wm_feature)
                 actions = action_nominal
-                bad_leg = None
+                detected_bad_leg = None
                 if contact_detector is not None:
                     if detector_latent is None:
                         detector_latent = rwm_inference.wm_latent
@@ -2848,19 +2851,19 @@ def test_rwm_real_robot_wm(model_path):
                             obs_pred_for_leg = contact_detector.last_obs_pred
                             if (obs_real_for_leg is not None) and (obs_pred_for_leg is not None):
                                 leg_errors = compute_leg_errors(obs_real_for_leg, obs_pred_for_leg)
-                                bad_leg = detect_stuck_leg(
+                                detected_bad_leg = detect_stuck_leg(
                                     leg_errors,
                                     threshold=CONTACT_ANOMALY_THRESHOLD,
                                 )
-                                if bad_leg is not None:
+                                if detected_bad_leg is not None:
                                     leg_err_vec = leg_errors.detach().cpu().squeeze(-1).numpy()
                                     max_err = float(np.max(leg_err_vec))
                                     print(
-                                        f"[LegAnomaly] step={step} bad_leg={bad_leg} "
+                                        f"[LegAnomaly] step={step} detected_bad_leg={detected_bad_leg} "
                                         f"max_err={max_err:.4f} leg_errors={np.array2string(leg_err_vec, precision=4)}"
                                     )
-                                if (bad_leg is not None) and (candidate_selector is None) and (not lift_controller.active):
-                                    lift_controller.trigger(bad_leg)
+                                if (detected_bad_leg is not None) and (candidate_selector is None) and (not lift_controller.active):
+                                    lift_controller.trigger(detected_bad_leg)
 
                 # Risk estimation (world-model anomaly now drives execution safety).
                 contact_error_value = 0.0
@@ -2869,11 +2872,15 @@ def test_rwm_real_robot_wm(model_path):
                         contact_error_value = float(torch.max(detector_last_error).detach().cpu().item())
                     else:
                         contact_error_value = float(detector_last_error)
+                stable_bad_leg = bad_leg_tracker.update(
+                    detected_bad_leg,
+                    active=int(detector_last_steps) >= 1,
+                )
                 risk_state = risk_estimator.update(
                     wm_error=contact_error_value,
                     contact_anomaly=bool(detector_last_anomaly),
                     contact_steps=int(detector_last_steps),
-                    bad_leg=bad_leg if bad_leg is not None else (lift_controller.leg_id if lift_controller.active else None),
+                    bad_leg=stable_bad_leg if stable_bad_leg >= 0 else (lift_controller.leg_id if lift_controller.active else None),
                 )
 
                 if candidate_selector is not None and rwm_inference.wm_latent is not None:
@@ -3088,10 +3095,12 @@ def test_rwm_real_robot_wm(model_path):
                         "contact_error": float(contact_error_value),
                         "contact_anomaly": int(bool(detector_last_anomaly)),
                         "contact_steps": int(detector_last_steps),
+                        "detected_bad_leg": int(-1 if detected_bad_leg is None else detected_bad_leg),
                         "bad_leg": int(risk_state.bad_leg),
                         "candidate_selected": candidate_selected,
                         "candidate_group": candidate_group,
                         "candidate_score": candidate_debug.get("score", 0.0),
+                        "forced_lift": int(bool(candidate_debug.get("forced_lift", False))),
                         "max_delta_before_filter": safety_dbg.get("max_delta_before_filter", 0.0),
                         "max_delta_after_filter": safety_dbg.get("max_delta_after_filter", 0.0),
                         "ankle_delta_max": safety_dbg.get("ankle_delta_max", 0.0),
@@ -3116,8 +3125,11 @@ def test_rwm_real_robot_wm(model_path):
                     print(
                         f"[SafetyEvent] step={step} risk={risk_state.level} "
                         f"contact_anomaly={int(bool(detector_last_anomaly))} "
-                        f"contact_steps={int(detector_last_steps)} bad_leg={int(risk_state.bad_leg)} "
+                        f"contact_steps={int(detector_last_steps)} "
+                        f"det_bad_leg={int(-1 if detected_bad_leg is None else detected_bad_leg)} "
+                        f"bad_leg={int(risk_state.bad_leg)} "
                         f"cand={candidate_selected} group={candidate_group} "
+                        f"forced_lift={int(bool(candidate_debug.get('forced_lift', False)))} "
                         f"score={candidate_debug.get('score', 0.0)} "
                         f"err={contact_error_value:.4f} ema={risk_state.ema_error:.4f} "
                         f"dq_raw={np.degrees(float(safety_dbg.get('max_delta_before_filter', 0.0))):.2f}deg "
@@ -3456,7 +3468,8 @@ if __name__ == '__main__':
         parser.add_argument("--model-path", default=None)
         parser.add_argument("--remove-dof-vel", action="store_true")
         parser.add_argument("--log-every", type=int, default=50)
-        parser.add_argument("--use-stability-filter", action="store_true")
+        parser.add_argument("--use-stability-filter", dest="use_stability_filter", action="store_true", default=True)
+        parser.add_argument("--disable-stability-filter", dest="use_stability_filter", action="store_false")
         parser.add_argument("--filter-debug-path", default=None)
         args = parser.parse_args()
 
