@@ -117,6 +117,7 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
     last_safe_action = np.zeros(18, dtype=np.float32)
     net_ok_count = 0
     net_fallback_count = 0
+    last_event_key = None
 
     # Keep remote-client logs consistent with local mode: always write under
     # this script directory so cwd differences do not affect output location.
@@ -268,12 +269,27 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                 while (time.time() - t_start) < TARGET_DT:
                     pass
 
-                if step % max(1, int(log_every)) == 0:
+                candidate_selected = str(resp.get("candidate_selected", "nominal"))
+                candidate_group = str(resp.get("candidate_group", ""))
+                bad_leg = int(resp.get("bad_leg", -1))
+                event_key = (int(risk_level), int(contact_anomaly), bad_leg, candidate_selected)
+                event_active = (
+                    risk_level > 0
+                    or contact_anomaly
+                    or candidate_group in {"lift", "ankle_protected", "scaled", "blend"}
+                )
+                should_print = (step % max(1, int(log_every)) == 0) or (event_active and event_key != last_event_key)
+                if should_print:
+                    last_event_key = event_key
                     print(
                         f"[RPI] step={step} "
                         f"net_ok={net_ok_count} fallback={net_fallback_count} "
                         f"raw[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
-                        f"risk={risk_level} contact_anomaly={int(contact_anomaly)} contact_steps={contact_steps}"
+                        f"risk={risk_level} contact_anomaly={int(contact_anomaly)} contact_steps={contact_steps} "
+                        f"bad_leg={bad_leg} cand={candidate_selected} group={candidate_group} "
+                        f"err={contact_error:.4f} ema={risk_ema:.4f} "
+                        f"dq_raw={np.degrees(float(safety_dbg.get('max_delta_before_filter', 0.0))):.2f}deg "
+                        f"dq_exec={np.degrees(float(safety_dbg.get('max_delta_after_filter', 0.0))):.2f}deg"
                     )
             print("\n[RPI] Reached MAX_STEPS. Robot keeps holding last pose (torque still enabled).")
             input("[RPI] Press Enter to finish and disable torque...")

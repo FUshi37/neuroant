@@ -105,6 +105,7 @@ def run_server(
     print(f"[PC] filter debug will be logged to: {filter_debug_path}")
 
     packet_count = 0
+    last_event_key = None
     try:
         while True:
             try:
@@ -159,7 +160,11 @@ def run_server(
                                 }
                                 print(f"[PC] contact anomaly detector error: {e}")
 
-                    if contact_detector is not None and anomaly_debug.get("enabled") and anomaly_debug.get("is_anomaly"):
+                    if (
+                        contact_detector is not None
+                        and anomaly_debug.get("enabled")
+                        and int(anomaly_debug.get("steps", 0)) >= 1
+                    ):
                         obs_real_for_leg = contact_detector.last_obs_real
                         obs_pred_for_leg = contact_detector.last_obs_pred
                         if (obs_real_for_leg is not None) and (obs_pred_for_leg is not None):
@@ -236,14 +241,32 @@ def run_server(
                     "error": filter_debug.get("error", ""),
                 }
                 debug_writer.writerow(row)
-                if packet_count <= 5 or (packet_count % max(1, int(log_every))) == 0:
+                event_key = (
+                    int(risk_state.level),
+                    bool(anomaly_debug.get("is_anomaly", False)),
+                    int(risk_state.bad_leg),
+                    str(row["candidate_selected"]),
+                )
+                event_active = (
+                    risk_state.level > 0
+                    or bool(anomaly_debug.get("is_anomaly", False))
+                    or str(row["candidate_group"]) in {"lift", "ankle_protected", "scaled", "blend"}
+                )
+                should_print = (
+                    packet_count <= 5
+                    or (packet_count % max(1, int(log_every))) == 0
+                    or (event_active and event_key != last_event_key)
+                )
+                if should_print:
+                    last_event_key = event_key
                     debug_file.flush()
                     print(
                         "[PC] "
                         f"from={addr[0]}:{addr[1]} step={step} "
                         f"act[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
                         f"server={server_ms:.2f}ms "
-                        f"filter_used={row['filter_used']} cand={row['candidate_selected']} score={row['candidate_score']} "
+                        f"filter_used={row['filter_used']} cand={row['candidate_selected']} "
+                        f"group={row['candidate_group']} score={row['candidate_score']} "
                         f"risk={risk_state.level} "
                         f"contact_enabled={int(anomaly_debug['enabled'])} "
                         f"contact_anomaly={int(anomaly_debug['is_anomaly'])} "

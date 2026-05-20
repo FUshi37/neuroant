@@ -2677,6 +2677,7 @@ def test_rwm_real_robot_wm(model_path):
 
     step = 0
     max_steps = MAX_STEPS  # Longer test run for better evaluation
+    last_safety_event_key = None
 
     print("Starting real robot control loop (ACTIVE MODE - robot will move!)")
     print("⚠️  WARNING: Robot control is ENABLED. Ensure robot is in safe position!")
@@ -2842,7 +2843,7 @@ def test_rwm_real_robot_wm(model_path):
                         # When anomaly is flagged, locate the most likely stuck leg
                         # from per-leg joint prediction errors, then trigger a short
                         # single-leg lift override.
-                        if detector_last_anomaly:
+                        if detector_last_steps >= 1:
                             obs_real_for_leg = contact_detector.last_obs_real
                             obs_pred_for_leg = contact_detector.last_obs_pred
                             if (obs_real_for_leg is not None) and (obs_pred_for_leg is not None):
@@ -3071,6 +3072,8 @@ def test_rwm_real_robot_wm(model_path):
                 previous_actions = action_for_obs.copy()
 
                 candidate_debug = getattr(candidate_selector, "last_debug", {}) if candidate_selector is not None else {}
+                candidate_selected = candidate_debug.get("selected", "nominal")
+                candidate_group = candidate_debug.get("selected_group", "")
                 safety_writer.writerow(
                     {
                         "step": step,
@@ -3086,8 +3089,8 @@ def test_rwm_real_robot_wm(model_path):
                         "contact_anomaly": int(bool(detector_last_anomaly)),
                         "contact_steps": int(detector_last_steps),
                         "bad_leg": int(risk_state.bad_leg),
-                        "candidate_selected": candidate_debug.get("selected", "nominal"),
-                        "candidate_group": candidate_debug.get("selected_group", ""),
+                        "candidate_selected": candidate_selected,
+                        "candidate_group": candidate_group,
                         "candidate_score": candidate_debug.get("score", 0.0),
                         "max_delta_before_filter": safety_dbg.get("max_delta_before_filter", 0.0),
                         "max_delta_after_filter": safety_dbg.get("max_delta_after_filter", 0.0),
@@ -3096,6 +3099,30 @@ def test_rwm_real_robot_wm(model_path):
                 )
                 if (step % LOG_FLUSH_EVERY_N_STEPS) == 0:
                     f_sd.flush()
+
+                safety_event_key = (
+                    int(risk_state.level),
+                    int(bool(detector_last_anomaly)),
+                    int(risk_state.bad_leg),
+                    str(candidate_selected),
+                )
+                safety_event_active = (
+                    risk_state.level > 0
+                    or bool(detector_last_anomaly)
+                    or str(candidate_group) in {"lift", "ankle_protected", "scaled", "blend"}
+                )
+                if safety_event_active and safety_event_key != last_safety_event_key:
+                    last_safety_event_key = safety_event_key
+                    print(
+                        f"[SafetyEvent] step={step} risk={risk_state.level} "
+                        f"contact_anomaly={int(bool(detector_last_anomaly))} "
+                        f"contact_steps={int(detector_last_steps)} bad_leg={int(risk_state.bad_leg)} "
+                        f"cand={candidate_selected} group={candidate_group} "
+                        f"score={candidate_debug.get('score', 0.0)} "
+                        f"err={contact_error_value:.4f} ema={risk_state.ema_error:.4f} "
+                        f"dq_raw={np.degrees(float(safety_dbg.get('max_delta_before_filter', 0.0))):.2f}deg "
+                        f"dq_exec={np.degrees(float(safety_dbg.get('max_delta_after_filter', 0.0))):.2f}deg"
+                    )
 
                 if ENABLE_TIMING_REPORT and step > 0 and (step % TIMING_REPORT_EVERY_N_STEPS) == 0:
                     sensor_ms = (sensor_end_pc - sensor_start_pc) * 1000.0
