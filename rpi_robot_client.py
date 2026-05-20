@@ -27,6 +27,9 @@ from test_rwm_real_robot_wm import (
 from deployment_safety import (
     RiskLevelEstimator,
     SafetyActionFilter,
+    RIGHT_FRONT_ANKLE_ACTION_OFFSET,
+    RIGHT_FRONT_KNEE_ACTION_OFFSET,
+    apply_right_front_action_offset,
     default_action_scale_per_dim,
     policy_action_to_exec_rad,
 )
@@ -109,6 +112,11 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
     risk_estimator = RiskLevelEstimator()
     admittance_filter = AdmittanceFilter(m=0.5, d=15.0, k=80.0, dt=TARGET_DT, num_joints=18)
     admittance_needs_init = True
+    print(
+        "[RPI] Right-front action offset: "
+        f"knee[10]+={RIGHT_FRONT_KNEE_ACTION_OFFSET:.2f}, "
+        f"ankle[11]+={RIGHT_FRONT_ANKLE_ACTION_OFFSET:.2f}"
+    )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server_addr = (server_ip, server_port)
@@ -192,7 +200,7 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                 if (step % LOG_FLUSH_EVERY_N_STEPS) == 0:
                     f_obs.flush()
 
-                action_for_obs = np.clip(action_raw, -1.0, 1.0)
+                action_for_obs = apply_right_front_action_offset(np.clip(action_raw, -1.0, 1.0))
                 prev_action_for_obs = action_for_obs.copy()
 
                 contact_error = float(resp.get("contact_error", 0.0))

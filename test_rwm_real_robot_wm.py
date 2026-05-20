@@ -33,6 +33,9 @@ from deployment_safety import (
     BadLegTracker,
     SafetyActionFilter,
     WorldModelCandidateSelector,
+    RIGHT_FRONT_ANKLE_ACTION_OFFSET,
+    RIGHT_FRONT_KNEE_ACTION_OFFSET,
+    apply_right_front_action_offset,
     default_action_scale_per_dim,
     policy_action_to_exec_rad,
 )
@@ -2527,6 +2530,11 @@ def test_rwm_real_robot_wm(model_path):
     lift_controller = LegLiftController(lift_steps=4)
     risk_estimator = RiskLevelEstimator()
     bad_leg_tracker = BadLegTracker()
+    print(
+        "Right-front action offset: "
+        f"knee[10]+={RIGHT_FRONT_KNEE_ACTION_OFFSET:.2f}, "
+        f"ankle[11]+={RIGHT_FRONT_ANKLE_ACTION_OFFSET:.2f}"
+    )
 
     # Initialize real robot components
     print("📍 Step 1: Initializing Servos...")
@@ -2903,7 +2911,7 @@ def test_rwm_real_robot_wm(model_path):
 
                 # Keep policy action in simulation space for observation/history.
                 action_raw_np = actions.detach().cpu().numpy().flatten().astype(np.float32)
-                action_for_obs = np.clip(action_raw_np, -1.0, 1.0)
+                action_for_obs = apply_right_front_action_offset(np.clip(action_raw_np, -1.0, 1.0))
 
                 # Convert policy-space action to execution rad, then apply hard safety filter.
                 action_exec_desired = policy_action_to_exec_rad(

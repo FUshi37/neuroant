@@ -43,11 +43,27 @@ RISK_FIXED_LEVEL2_THRESHOLD = 0.22
 BAD_LEG_TRACK_DECAY = 0.72
 BAD_LEG_TRACK_HOLD_STEPS = 8
 
+# Simple right-front leg action offset.
+# Action order: [l1, l2, l3, r1, r2, r3], three joints per leg.
+# r1 knee = action[10], r1 ankle = action[11].
+# For the right-front leg, larger knee action and smaller ankle action lift the foot.
+RIGHT_FRONT_ACTION_OFFSET_ENABLED = True
+RIGHT_FRONT_KNEE_ACTION_OFFSET = 0.35
+RIGHT_FRONT_ANKLE_ACTION_OFFSET = -0.55
+
 
 def default_action_scale_per_dim() -> np.ndarray:
     out = np.full(18, DEFAULT_HIP_KNEE_SCALE_RAD, dtype=np.float32)
     out[ANKLE_INDICES] = DEFAULT_ANKLE_BASE_SCALE_RAD
     return out
+
+
+def apply_right_front_action_offset(action: np.ndarray) -> np.ndarray:
+    out = np.asarray(action, dtype=np.float32).copy()
+    if RIGHT_FRONT_ACTION_OFFSET_ENABLED and out.size >= 12:
+        out[10] += RIGHT_FRONT_KNEE_ACTION_OFFSET
+        out[11] += RIGHT_FRONT_ANKLE_ACTION_OFFSET
+    return np.clip(out, -1.0, 1.0)
 
 
 def _ankle_down_mask(delta: np.ndarray) -> np.ndarray:
