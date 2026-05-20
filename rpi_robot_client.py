@@ -200,7 +200,8 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                 if (step % LOG_FLUSH_EVERY_N_STEPS) == 0:
                     f_obs.flush()
 
-                action_for_obs = apply_right_front_action_offset(np.clip(action_raw, -1.0, 1.0))
+                action_for_obs = np.clip(action_raw, -1.0, 1.0)
+                action_for_exec = apply_right_front_action_offset(action_for_obs)
                 prev_action_for_obs = action_for_obs.copy()
 
                 contact_error = float(resp.get("contact_error", 0.0))
@@ -217,7 +218,7 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                 risk_ema = float(resp.get("risk_ema", risk_state.ema_error))
 
                 action_exec_desired = policy_action_to_exec_rad(
-                    action_raw_clipped=action_for_obs,
+                    action_raw_clipped=action_for_exec,
                     action_scale_per_dim=action_scale,
                     use_asymmetric_ankle_mapping=USE_ASYMMETRIC_ANKLE_MAPPING,
                     asym_lift_range_rad=ASYM_ANKLE_LIFT_RANGE_RAD,

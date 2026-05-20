@@ -2911,11 +2911,12 @@ def test_rwm_real_robot_wm(model_path):
 
                 # Keep policy action in simulation space for observation/history.
                 action_raw_np = actions.detach().cpu().numpy().flatten().astype(np.float32)
-                action_for_obs = apply_right_front_action_offset(np.clip(action_raw_np, -1.0, 1.0))
+                action_for_obs = np.clip(action_raw_np, -1.0, 1.0)
+                action_for_exec = apply_right_front_action_offset(action_for_obs)
 
                 # Convert policy-space action to execution rad, then apply hard safety filter.
                 action_exec_desired = policy_action_to_exec_rad(
-                    action_raw_clipped=action_for_obs,
+                    action_raw_clipped=action_for_exec,
                     action_scale_per_dim=action_scale_np,
                     use_asymmetric_ankle_mapping=USE_ASYMMETRIC_ANKLE_MAPPING,
                     asym_lift_range_rad=ASYM_ANKLE_LIFT_RANGE_RAD,
