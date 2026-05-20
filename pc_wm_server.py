@@ -50,7 +50,7 @@ def run_server(
             world_model=inference.world_model,
             action_dim=18,
             horizon=4,
-            max_lift_candidates=2,
+            max_lift_candidates=6,
             device="cpu",
         )
         if (use_stability_filter and inference.world_model is not None)

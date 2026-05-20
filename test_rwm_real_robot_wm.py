@@ -104,8 +104,8 @@ ENABLE_JOINT_LIMIT_PRINT = False
 
 # ==================== Contact anomaly detection switches ====================
 # Toggle world-model-prior based contact anomaly detection/action correction.
-ENABLE_CONTACT_ANOMALY_DETECTOR = False
-ENABLE_WM_CANDIDATE_SELECTOR = False
+ENABLE_CONTACT_ANOMALY_DETECTOR = True
+ENABLE_WM_CANDIDATE_SELECTOR = True
 CONTACT_ANOMALY_THRESHOLD = 0.15
 CONTACT_ANOMALY_EMA_ALPHA = 0.90
 CONTACT_ANOMALY_TRIGGER_COUNT = 3
@@ -2506,7 +2506,7 @@ def test_rwm_real_robot_wm(model_path):
         world_model=rwm_inference.world_model,
         action_dim=18,
         horizon=4,
-        max_lift_candidates=2,
+        max_lift_candidates=6,
         device='cpu',
     ) if (ENABLE_WM_CANDIDATE_SELECTOR and rwm_inference.world_model is not None) else None
     contact_detector = ContactAnomalyDetector(
