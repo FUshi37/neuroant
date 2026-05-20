@@ -6,8 +6,15 @@ import numpy as np
 import torch
 
 
-ANKLE_INDICES = np.array([2, 5, 8, 11, 14, 17], dtype=np.int64)
-LIFT_DIR = np.array([1, 1, 1, -1, -1, -1], dtype=np.float32)
+ANKLE_INDEX_LIST = [2, 5, 8, 11, 14, 17]
+KNEE_INDEX_LIST = [1, 4, 7, 10, 13, 16]
+LIFT_DIR_LIST = [1, 1, 1, -1, -1, -1]
+KNEE_LIFT_DIR_LIST = [-1, -1, -1, 1, 1, 1]
+
+ANKLE_INDICES = np.array(ANKLE_INDEX_LIST, dtype=np.int64)
+LIFT_DIR = np.array(LIFT_DIR_LIST, dtype=np.float32)
+KNEE_INDICES = np.array(KNEE_INDEX_LIST, dtype=np.int64)
+KNEE_LIFT_DIR = np.array(KNEE_LIFT_DIR_LIST, dtype=np.float32)
 
 
 # Deployment-side execution scale (rad per normalized action unit).
@@ -211,6 +218,39 @@ class WorldModelCandidateSelector:
         self.device = torch.device(device)
         self.last_debug = {}
 
+    @staticmethod
+    def _risk_level(risk_state: Optional[RiskState]) -> int:
+        if risk_state is None:
+            return 0
+        return int(max(0, min(2, int(getattr(risk_state, "level", 0)))))
+
+    @staticmethod
+    def _bad_leg(risk_state: Optional[RiskState]) -> int:
+        if risk_state is None:
+            return -1
+        leg = int(getattr(risk_state, "bad_leg", -1))
+        return leg if 0 <= leg < 6 else -1
+
+    @staticmethod
+    def _candidate_group(name: str) -> str:
+        if name.startswith("lift_leg_"):
+            return "lift"
+        if name.startswith("scale_"):
+            return "scaled"
+        if name == "blend_prev":
+            return "blend"
+        if name == "ankle_protected":
+            return "ankle_protected"
+        return "nominal"
+
+    @staticmethod
+    def _risk_scales(risk_level: int) -> Tuple[float, float, float, float]:
+        if risk_level >= 2:
+            return 0.50, 0.30, 0.85, 0.28
+        if risk_level == 1:
+            return 0.65, 0.45, 0.70, 0.40
+        return 0.75, 0.55, 0.60, 0.55
+
     def _ensure_2d(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 1:
             return x.unsqueeze(0)
@@ -234,33 +274,71 @@ class WorldModelCandidateSelector:
             return mean
         return pred
 
-    def _build_candidates(self, nominal: torch.Tensor, prev_action: Optional[torch.Tensor]) -> List[Tuple[str, torch.Tensor]]:
+    def _lift_candidate(self, nominal: torch.Tensor, leg_id: int, risk_level: int) -> torch.Tensor:
+        leg_id = int(max(0, min(5, leg_id)))
+        base = leg_id * 3
+        knee = base + 1
+        ankle = base + 2
+        # Positive lift direction differs between left and right legs in the
+        # normalized policy/action coordinates. Keep the candidate construction
+        # in the same sim-aligned convention used by the hardware mapper.
+        ankle_gain = 0.18 + 0.07 * float(risk_level)
+        knee_gain = 0.35 * ankle_gain
+        out = nominal.clone()
+        out[..., ankle] = out[..., ankle] + ankle_gain * float(LIFT_DIR[leg_id])
+        out[..., knee] = out[..., knee] + knee_gain * float(KNEE_LIFT_DIR[leg_id])
+        return torch.clamp(out, -1.0, 1.0)
+
+    def _build_candidates(
+        self,
+        nominal: torch.Tensor,
+        prev_action: Optional[torch.Tensor],
+        risk_state: Optional[RiskState] = None,
+    ) -> List[Tuple[str, torch.Tensor]]:
+        risk_level = self._risk_level(risk_state)
+        bad_leg = self._bad_leg(risk_state)
+        scale_1, scale_2, blend_prev_gain, ankle_gain = self._risk_scales(risk_level)
+
         cands: List[Tuple[str, torch.Tensor]] = []
         cands.append(("nominal", nominal))
-        cands.append(("scale_0.7", nominal * 0.7))
-        cands.append(("scale_0.5", nominal * 0.5))
+        cands.append((f"scale_{scale_1:.2f}", nominal * scale_1))
+        cands.append((f"scale_{scale_2:.2f}", nominal * scale_2))
         if prev_action is not None:
-            cands.append(("blend_prev", 0.6 * prev_action + 0.4 * nominal))
+            cands.append(("blend_prev", blend_prev_gain * prev_action + (1.0 - blend_prev_gain) * nominal))
         ankle_protected = nominal.clone()
-        ankle_protected[..., ANKLE_INDICES] = ankle_protected[..., ANKLE_INDICES] * 0.5
+        ankle_protected[..., ANKLE_INDEX_LIST] = ankle_protected[..., ANKLE_INDEX_LIST] * ankle_gain
         cands.append(("ankle_protected", ankle_protected))
-        for leg_id in range(self.max_lift_candidates):
-            base = leg_id * 3
-            lift = nominal.clone()
-            lift[..., base + 1] = torch.clamp(lift[..., base + 1] - 0.20, -1.0, 1.0)
-            lift[..., base + 2] = torch.clamp(lift[..., base + 2] + 0.25, -1.0, 1.0)
-            cands.append((f"lift_leg_{leg_id}", lift))
+
+        lift_legs: List[int] = []
+        if risk_level >= 1:
+            if bad_leg >= 0:
+                lift_legs.append(bad_leg)
+            max_lifts = self.max_lift_candidates if risk_level >= 2 else min(self.max_lift_candidates, 2)
+            for leg_id in range(max_lifts):
+                if leg_id not in lift_legs:
+                    lift_legs.append(leg_id)
+        for leg_id in lift_legs[: self.max_lift_candidates]:
+            cands.append((f"lift_leg_{leg_id}", self._lift_candidate(nominal, leg_id, risk_level)))
         return cands
 
     @torch.no_grad()
-    def select(self, prev_latent, is_first: torch.Tensor, action_nominal: torch.Tensor, prev_action: Optional[torch.Tensor] = None):
+    def select(
+        self,
+        prev_latent,
+        is_first: torch.Tensor,
+        action_nominal: torch.Tensor,
+        prev_action: Optional[torch.Tensor] = None,
+        risk_state: Optional[RiskState] = None,
+    ):
         try:
             if self.world_model is None or prev_latent is None:
                 self.last_debug = {"selected": "nominal", "score": 0.0, "fallback": 1}
                 return torch.clamp(action_nominal, -1.0, 1.0)
             nominal = torch.clamp(self._ensure_2d(action_nominal).to(self.device, dtype=torch.float32), -1.0, 1.0)
             prev = None if prev_action is None else torch.clamp(self._ensure_2d(prev_action).to(self.device, dtype=torch.float32), -1.0, 1.0)
-            candidates = self._build_candidates(nominal, prev)
+            risk_level = self._risk_level(risk_state)
+            bad_leg = self._bad_leg(risk_state)
+            candidates = self._build_candidates(nominal, prev, risk_state)
             names = [n for n, _ in candidates]
             cand_t = torch.cat([c for _, c in candidates], dim=0)
 
@@ -275,6 +353,7 @@ class WorldModelCandidateSelector:
             is_first_b = is_first.reshape(-1).to(self.device, dtype=torch.float32).repeat_interleave(n)
 
             score = torch.zeros(n, device=self.device)
+            ang_weight = 0.35 * (1.0 + 0.25 * float(risk_level))
             for _ in range(self.horizon):
                 latent = dynamics.img_step(latent, cand_rssm, sample=True) if hasattr(dynamics, "img_step") else dynamics.imagine_with_action(latent, cand_rssm)
                 pred_prop = self._decode_prop(latent)
@@ -282,20 +361,53 @@ class WorldModelCandidateSelector:
                 grav = pred_prop[:, 3:6]
                 grav_dev = torch.norm(grav - torch.tensor([0.0, 0.0, -1.0], device=self.device), dim=-1)
                 ang_mag = torch.norm(base_ang, dim=-1)
-                score = score + grav_dev + 0.35 * ang_mag
+                score = score + grav_dev + ang_weight * ang_mag
                 is_first_b = torch.zeros_like(is_first_b)
 
             if prev is not None:
-                score = score + 0.08 * torch.norm(cand_t - prev.repeat(n, 1), dim=-1)
-            score = score + 0.15 * torch.norm(cand_t[:, ANKLE_INDICES], dim=-1)
+                prev_rep = prev.repeat(n, 1)
+                smooth_weight = 0.08 * (1.0 + 0.75 * float(risk_level))
+                ankle_delta_weight = 0.04 * float(risk_level)
+                score = score + smooth_weight * torch.norm(cand_t - prev_rep, dim=-1)
+                score = score + ankle_delta_weight * torch.norm((cand_t - prev_rep)[:, ANKLE_INDEX_LIST], dim=-1)
+
+            lift_dir_t = torch.tensor(LIFT_DIR_LIST, device=self.device, dtype=cand_t.dtype)
+            ankle = cand_t[:, ANKLE_INDEX_LIST]
+            aligned_ankle = ankle * lift_dir_t
+            down_motion = torch.relu(-aligned_ankle)
+            ankle_weight = 0.15 * (1.0 + 0.80 * float(risk_level))
+            down_weight = 0.10 * float(risk_level)
+            score = score + ankle_weight * torch.norm(ankle, dim=-1)
+            score = score + down_weight * torch.norm(down_motion, dim=-1)
+
+            if risk_level > 0:
+                bias = torch.zeros(n, device=self.device, dtype=score.dtype)
+                for idx, name in enumerate(names):
+                    if name == "nominal":
+                        bias[idx] += 0.03 * float(risk_level)
+                    if name.startswith("lift_leg_"):
+                        try:
+                            leg_id = int(name.rsplit("_", 1)[-1])
+                        except Exception:
+                            leg_id = -1
+                        if bad_leg >= 0 and leg_id == bad_leg:
+                            bias[idx] -= 0.05 * float(risk_level)
+                        elif bad_leg >= 0:
+                            bias[idx] += 0.03 * float(risk_level)
+                score = score + bias
 
             best_idx = int(torch.argmin(score).detach().cpu().item())
             self.last_debug = {
                 "selected": names[best_idx],
+                "selected_group": self._candidate_group(names[best_idx]),
                 "score": float(score[best_idx].detach().cpu().item()),
                 "fallback": 0,
                 "num_candidates": int(n),
                 "used": bool(best_idx != 0),
+                "risk_level": int(risk_level),
+                "bad_leg": int(bad_leg),
+                "ankle_weight": float(ankle_weight),
+                "down_weight": float(down_weight),
             }
             return torch.clamp(cand_t[best_idx:best_idx + 1], -1.0, 1.0)
         except Exception as e:

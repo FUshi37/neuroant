@@ -1260,8 +1260,10 @@ class LegLiftController:
         base = self.leg_id * 3
         knee = base + 1
         ankle = base + 2
-        corrected[..., knee] = corrected[..., knee] - 0.25
-        corrected[..., ankle] = corrected[..., ankle] + 0.25
+        ankle_dir = torch.tensor([1, 1, 1, -1, -1, -1], device=corrected.device, dtype=corrected.dtype)
+        knee_dir = torch.tensor([-1, -1, -1, 1, 1, 1], device=corrected.device, dtype=corrected.dtype)
+        corrected[..., knee] = corrected[..., knee] + 0.25 * knee_dir[self.leg_id]
+        corrected[..., ankle] = corrected[..., ankle] + 0.25 * ankle_dir[self.leg_id]
 
         self.counter += 1
         if self.counter >= self.lift_steps:
@@ -2728,7 +2730,7 @@ def test_rwm_real_robot_wm(model_path):
                     "step", "raw_action_min", "raw_action_max", "raw_action_mean",
                     "exec_action_min", "exec_action_max", "exec_action_mean",
                     "risk_level", "wm_error", "contact_error", "contact_anomaly", "contact_steps",
-                    "candidate_selected", "candidate_score", "max_delta_before_filter",
+                    "bad_leg", "candidate_selected", "candidate_group", "candidate_score", "max_delta_before_filter",
                     "max_delta_after_filter", "ankle_delta_max",
                 ],
             )
@@ -2827,16 +2829,7 @@ def test_rwm_real_robot_wm(model_path):
                 #print("wm_feature: ", wm_feature)
                 action_nominal = policy(obs_dict["prop"], history_tensor, wm_feature)
                 actions = action_nominal
-                if candidate_selector is not None and rwm_inference.wm_latent is not None:
-                    prev_action_t = None if previous_actions is None else torch.from_numpy(
-                        np.asarray(previous_actions, dtype=np.float32)
-                    ).unsqueeze(0)
-                    actions = candidate_selector.select(
-                        prev_latent=rwm_inference.wm_latent,
-                        is_first=rwm_inference.wm_is_first,
-                        action_nominal=actions,
-                        prev_action=prev_action_t,
-                    )
+                bad_leg = None
                 if contact_detector is not None:
                     if detector_latent is None:
                         detector_latent = rwm_inference.wm_latent
@@ -2849,7 +2842,7 @@ def test_rwm_real_robot_wm(model_path):
                         # When anomaly is flagged, locate the most likely stuck leg
                         # from per-leg joint prediction errors, then trigger a short
                         # single-leg lift override.
-                        if detector_last_anomaly and (not lift_controller.active):
+                        if detector_last_anomaly:
                             obs_real_for_leg = contact_detector.last_obs_real
                             obs_pred_for_leg = contact_detector.last_obs_pred
                             if (obs_real_for_leg is not None) and (obs_pred_for_leg is not None):
@@ -2865,15 +2858,8 @@ def test_rwm_real_robot_wm(model_path):
                                         f"[LegAnomaly] step={step} bad_leg={bad_leg} "
                                         f"max_err={max_err:.4f} leg_errors={np.array2string(leg_err_vec, precision=4)}"
                                     )
+                                if (bad_leg is not None) and (candidate_selector is None) and (not lift_controller.active):
                                     lift_controller.trigger(bad_leg)
-                # Apply temporary one-leg lift override and automatically return
-                # control to policy after lift_steps.
-                actions = lift_controller.apply(actions)
-                #print("actions: ", actions)
-
-                # Keep policy action in simulation space for observation/history.
-                action_raw_np = actions.detach().cpu().numpy().flatten().astype(np.float32)
-                action_for_obs = np.clip(action_raw_np, -1.0, 1.0)
 
                 # Risk estimation (world-model anomaly now drives execution safety).
                 contact_error_value = 0.0
@@ -2886,8 +2872,30 @@ def test_rwm_real_robot_wm(model_path):
                     wm_error=contact_error_value,
                     contact_anomaly=bool(detector_last_anomaly),
                     contact_steps=int(detector_last_steps),
-                    bad_leg=lift_controller.leg_id if lift_controller.active else None,
+                    bad_leg=bad_leg if bad_leg is not None else (lift_controller.leg_id if lift_controller.active else None),
                 )
+
+                if candidate_selector is not None and rwm_inference.wm_latent is not None:
+                    prev_action_t = None if previous_actions is None else torch.from_numpy(
+                        np.asarray(previous_actions, dtype=np.float32)
+                    ).unsqueeze(0)
+                    actions = candidate_selector.select(
+                        prev_latent=rwm_inference.wm_latent,
+                        is_first=rwm_inference.wm_is_first,
+                        action_nominal=actions,
+                        prev_action=prev_action_t,
+                        risk_state=risk_state,
+                    )
+                # Apply temporary one-leg lift override only when the WM
+                # candidate selector is unavailable; otherwise lift recovery is
+                # represented inside the risk-conditioned candidate set.
+                if candidate_selector is None:
+                    actions = lift_controller.apply(actions)
+                #print("actions: ", actions)
+
+                # Keep policy action in simulation space for observation/history.
+                action_raw_np = actions.detach().cpu().numpy().flatten().astype(np.float32)
+                action_for_obs = np.clip(action_raw_np, -1.0, 1.0)
 
                 # Convert policy-space action to execution rad, then apply hard safety filter.
                 action_exec_desired = policy_action_to_exec_rad(
@@ -3077,7 +3085,9 @@ def test_rwm_real_robot_wm(model_path):
                         "contact_error": float(contact_error_value),
                         "contact_anomaly": int(bool(detector_last_anomaly)),
                         "contact_steps": int(detector_last_steps),
+                        "bad_leg": int(risk_state.bad_leg),
                         "candidate_selected": candidate_debug.get("selected", "nominal"),
+                        "candidate_group": candidate_debug.get("selected_group", ""),
                         "candidate_score": candidate_debug.get("score", 0.0),
                         "max_delta_before_filter": safety_dbg.get("max_delta_before_filter", 0.0),
                         "max_delta_after_filter": safety_dbg.get("max_delta_after_filter", 0.0),

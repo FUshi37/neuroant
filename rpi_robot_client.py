@@ -142,7 +142,7 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                     "step", "raw_action_min", "raw_action_max", "raw_action_mean",
                     "exec_action_min", "exec_action_max", "exec_action_mean",
                     "risk_level", "wm_error", "contact_error", "contact_anomaly", "contact_steps",
-                    "candidate_selected", "candidate_score", "max_delta_before_filter",
+                    "bad_leg", "candidate_selected", "candidate_group", "candidate_score", "max_delta_before_filter",
                     "max_delta_after_filter", "ankle_delta_max",
                 ],
             )
@@ -202,6 +202,9 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                     contact_steps=contact_steps,
                     bad_leg=int(resp.get("bad_leg", -1)),
                 )
+                risk_level = int(resp.get("risk_level", risk_state.level))
+                risk_level = max(0, min(2, risk_level))
+                risk_ema = float(resp.get("risk_ema", risk_state.ema_error))
 
                 action_exec_desired = policy_action_to_exec_rad(
                     action_raw_clipped=action_for_obs,
@@ -211,7 +214,7 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                     asym_sink_range_rad=ASYM_ANKLE_SINK_RANGE_RAD,
                 )
                 action_exec_desired = np.clip(action_exec_desired, action_limits["min"], action_limits["max"])
-                action_exec, safety_dbg = safety_filter.filter(action_exec_desired, risk_state.level)
+                action_exec, safety_dbg = safety_filter.filter(action_exec_desired, risk_level)
                 if USE_ADMITTANCE:
                     if admittance_needs_init:
                         current_sim_angles = servo_angles_to_sim_angles(position_read)
@@ -246,12 +249,14 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                         "exec_action_min": float(action_exec.min()),
                         "exec_action_max": float(action_exec.max()),
                         "exec_action_mean": float(action_exec.mean()),
-                        "risk_level": int(risk_state.level),
-                        "wm_error": float(risk_state.ema_error),
+                        "risk_level": int(risk_level),
+                        "wm_error": float(risk_ema),
                         "contact_error": float(contact_error),
                         "contact_anomaly": int(contact_anomaly),
                         "contact_steps": int(contact_steps),
+                        "bad_leg": int(resp.get("bad_leg", -1)),
                         "candidate_selected": str(resp.get("candidate_selected", "nominal")),
+                        "candidate_group": str(resp.get("candidate_group", "")),
                         "candidate_score": float(resp.get("candidate_score", 0.0)),
                         "max_delta_before_filter": safety_dbg.get("max_delta_before_filter", 0.0),
                         "max_delta_after_filter": safety_dbg.get("max_delta_after_filter", 0.0),
@@ -268,7 +273,7 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                         f"[RPI] step={step} "
                         f"net_ok={net_ok_count} fallback={net_fallback_count} "
                         f"raw[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
-                        f"risk={risk_state.level} contact_anomaly={int(contact_anomaly)} contact_steps={contact_steps}"
+                        f"risk={risk_level} contact_anomaly={int(contact_anomaly)} contact_steps={contact_steps}"
                     )
             print("\n[RPI] Reached MAX_STEPS. Robot keeps holding last pose (torque still enabled).")
             input("[RPI] Press Enter to finish and disable torque...")

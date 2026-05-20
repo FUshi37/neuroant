@@ -25,7 +25,7 @@ from test_rwm_real_robot_wm import (
     compute_leg_errors,
     detect_stuck_leg,
 )
-from deployment_safety import WorldModelCandidateSelector
+from deployment_safety import RiskLevelEstimator, WorldModelCandidateSelector
 
 
 def _to_float_list(arr):
@@ -69,6 +69,7 @@ def run_server(
         else None
     )
     detector_latent = inference.wm_latent
+    risk_estimator = RiskLevelEstimator()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((host, port))
@@ -85,8 +86,12 @@ def run_server(
             "filter_enabled",
             "filter_used",
             "candidate_selected",
+            "candidate_group",
             "candidate_score",
             "num_candidates",
+            "risk_level",
+            "risk_ema",
+            "bad_leg",
             "horizon",
             "server_ms",
             "action_min",
@@ -128,6 +133,7 @@ def run_server(
                 with torch.no_grad():
                     wm_feature = inference.update_world_model(obs_dict, prev_action)
                     actions = policy(obs_dict["prop"], history_t, wm_feature)
+                    bad_leg = None
                     if contact_detector is not None:
                         if detector_latent is None:
                             detector_latent = inference.wm_latent
@@ -152,7 +158,21 @@ def run_server(
                                     "steps": 0,
                                 }
                                 print(f"[PC] contact anomaly detector error: {e}")
-                    bad_leg = None
+
+                    if contact_detector is not None and anomaly_debug.get("enabled") and anomaly_debug.get("is_anomaly"):
+                        obs_real_for_leg = contact_detector.last_obs_real
+                        obs_pred_for_leg = contact_detector.last_obs_pred
+                        if (obs_real_for_leg is not None) and (obs_pred_for_leg is not None):
+                            leg_errors = compute_leg_errors(obs_real_for_leg, obs_pred_for_leg)
+                            bad_leg = detect_stuck_leg(leg_errors, threshold=CONTACT_ANOMALY_THRESHOLD)
+
+                    risk_state = risk_estimator.update(
+                        wm_error=float(anomaly_debug.get("error")) if isinstance(anomaly_debug.get("error"), (float, int)) else 0.0,
+                        contact_anomaly=bool(anomaly_debug.get("is_anomaly", False)),
+                        contact_steps=int(anomaly_debug.get("steps", 0)),
+                        bad_leg=bad_leg,
+                    )
+
                     if candidate_selector is not None and inference.wm_latent is not None:
                         try:
                             prev_action_t = (
@@ -165,19 +185,13 @@ def run_server(
                                 is_first=inference.wm_is_first,
                                 action_nominal=actions,
                                 prev_action=prev_action_t,
+                                risk_state=risk_state,
                             )
                             filter_debug = dict(getattr(candidate_selector, "last_debug", filter_debug))
                         except Exception as e:
                             # Keep control alive if imagination branch fails.
                             filter_debug = {"used": False, "error": str(e)}
                             print(f"[PC] stability filter disabled for this step: {e}")
-
-                    if contact_detector is not None and anomaly_debug.get("enabled") and anomaly_debug.get("is_anomaly"):
-                        obs_real_for_leg = contact_detector.last_obs_real
-                        obs_pred_for_leg = contact_detector.last_obs_pred
-                        if (obs_real_for_leg is not None) and (obs_pred_for_leg is not None):
-                            leg_errors = compute_leg_errors(obs_real_for_leg, obs_pred_for_leg)
-                            bad_leg = detect_stuck_leg(leg_errors, threshold=CONTACT_ANOMALY_THRESHOLD)
 
                 action_raw = actions.detach().cpu().numpy().reshape(-1)
                 action_raw = np.clip(action_raw, -1.0, 1.0)
@@ -192,8 +206,13 @@ def run_server(
                     "contact_anomaly": bool(anomaly_debug.get("is_anomaly", False)),
                     "contact_error": float(anomaly_debug.get("error")) if isinstance(anomaly_debug.get("error"), (float, int)) else 0.0,
                     "contact_steps": int(anomaly_debug.get("steps", 0)),
-                    "bad_leg": int(-1 if bad_leg is None else bad_leg),
+                    "risk_level": int(risk_state.level),
+                    "risk_ema": float(risk_state.ema_error),
+                    "risk_baseline_mean": float(risk_state.baseline_mean),
+                    "risk_baseline_std": float(risk_state.baseline_std),
+                    "bad_leg": int(risk_state.bad_leg),
                     "candidate_selected": str(filter_debug.get("selected", "nominal")),
+                    "candidate_group": str(filter_debug.get("selected_group", "")),
                     "candidate_score": float(filter_debug.get("score", 0.0)) if isinstance(filter_debug.get("score", 0.0), (float, int)) else 0.0,
                 }
                 packet_count += 1
@@ -203,8 +222,12 @@ def run_server(
                     "filter_enabled": int(candidate_selector is not None),
                     "filter_used": int(bool(filter_debug.get("used", False))),
                     "candidate_selected": filter_debug.get("selected", ""),
+                    "candidate_group": filter_debug.get("selected_group", ""),
                     "candidate_score": filter_debug.get("score", ""),
                     "num_candidates": filter_debug.get("num_candidates", ""),
+                    "risk_level": int(risk_state.level),
+                    "risk_ema": float(risk_state.ema_error),
+                    "bad_leg": int(risk_state.bad_leg),
                     "horizon": 4,
                     "server_ms": server_ms,
                     "action_min": float(action_raw.min()),
@@ -221,11 +244,12 @@ def run_server(
                         f"act[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
                         f"server={server_ms:.2f}ms "
                         f"filter_used={row['filter_used']} cand={row['candidate_selected']} score={row['candidate_score']} "
+                        f"risk={risk_state.level} "
                         f"contact_enabled={int(anomaly_debug['enabled'])} "
                         f"contact_anomaly={int(anomaly_debug['is_anomaly'])} "
                         f"contact_error={anomaly_debug['error']} "
                         f"contact_steps={anomaly_debug['steps']} "
-                        f"bad_leg={-1 if bad_leg is None else bad_leg}"
+                        f"bad_leg={risk_state.bad_leg}"
                     )
             except Exception as e:
                 resp = {
