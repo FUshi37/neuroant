@@ -3450,6 +3450,15 @@ if __name__ == '__main__':
         sys.argv = [arg for arg in sys.argv if arg != '--disable-rate-limiter']
     remote_ip = None
     remote_port = 9876
+    remote_timeout_ms = 50.0
+    if '--remote-timeout-ms' in sys.argv:
+        idx = sys.argv.index('--remote-timeout-ms')
+        if idx + 1 < len(sys.argv):
+            remote_timeout_ms = float(sys.argv[idx + 1])
+            sys.argv = sys.argv[:idx] + sys.argv[idx + 2:]
+        else:
+            print("Usage: --remote-timeout-ms <MS>")
+            sys.exit(1)
     if '--remote-wm-server-ip' in sys.argv:
         idx = sys.argv.index('--remote-wm-server-ip')
         if idx + 1 < len(sys.argv):
@@ -3468,11 +3477,11 @@ if __name__ == '__main__':
     # Raspberry Pi remote-client mode: keep local one-process mode untouched when absent.
     if remote_ip is not None:
         from rpi_robot_client import run_client
-        print(f"Running remote WM client mode -> {remote_ip}:{remote_port}")
+        print(f"Running remote WM client mode -> {remote_ip}:{remote_port} timeout={remote_timeout_ms:.1f} ms")
         run_client(
             remote_ip,
             remote_port,
-            timeout_s=0.05,
+            timeout_s=max(0.001, remote_timeout_ms / 1000.0),
             log_every=50,
             enable_rate_limiter=not disable_rate_limiter,
         )
@@ -3523,7 +3532,7 @@ if __name__ == '__main__':
             sim_path = sys.argv[2] if len(sys.argv) > 2 else None
             run_replay_sim_dof(sim_path)
         else:
-            print("Usage: python test_rwm_real_robot_wm.py [--disable-rate-limiter] [--verify|--verify-limits|--verify-mapping|--verify-safety|--imu-test|--replay-sim-dof [sim_data_path]|--remote-wm-server-ip <PC_IP> [--remote-wm-server-port <PORT>]|--pc-wm-server [--model-path PATH] [--host HOST] [--port PORT] [--remove-dof-vel] [--use-stability-filter]]")
+            print("Usage: python test_rwm_real_robot_wm.py [--disable-rate-limiter] [--verify|--verify-limits|--verify-mapping|--verify-safety|--imu-test|--replay-sim-dof [sim_data_path]|--remote-wm-server-ip <PC_IP> [--remote-wm-server-port <PORT>] [--remote-timeout-ms <MS>]|--pc-wm-server [--model-path PATH] [--host HOST] [--port PORT] [--remove-dof-vel] [--use-stability-filter]]")
     else:
         # Path to your trained RWM model checkpoint
         current_dir = os.path.dirname(os.path.abspath(__file__))

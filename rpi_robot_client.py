@@ -151,6 +151,8 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
                 fieldnames=[
                     "step", "raw_action_min", "raw_action_max", "raw_action_mean",
                     "exec_action_min", "exec_action_max", "exec_action_mean",
+                    "net_ok", "net_fallback", "net_error", "resp_step",
+                    "server_ms", "request_ms", "control_dt_ms", "loop_dt_ms", "timeout_ms",
                     "risk_level", "wm_error", "contact_error", "contact_anomaly", "contact_steps",
                     "detected_bad_leg", "bad_leg", "candidate_selected", "candidate_group", "candidate_score",
                     "forced_lift", "max_delta_before_filter",
@@ -159,14 +161,22 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
             )
             sd_writer.writeheader()
             for step in range(MAX_STEPS):
-                t_start = time.time()
+                t_start = time.perf_counter()
                 resp = {}
+                resp_step = -1
+                server_ms = 0.0
+                request_ms = 0.0
+                net_ok_step = False
+                net_fallback_step = False
+                net_error = ""
+                request_t0 = None
                 real_obs, obs_wo_cmd, position_read, imu_data = create_observation_from_real_robot(
                     servos, q_imu, step, history_length, cpg_reward, prev_action_for_obs
                 )
                 history_flat = np.concatenate(list(trajectory_history)).astype(np.float32)
 
                 try:
+                    request_t0 = time.perf_counter()
                     resp = _request_action(
                         sock=sock,
                         server_addr=server_addr,
@@ -176,21 +186,30 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
                         prev_action=prev_action_for_obs,
                         timeout_s=timeout_s,
                     )
-                    if resp.get("ok") and int(resp.get("step", -1)) == step:
+                    request_ms = float((time.perf_counter() - request_t0) * 1000.0)
+                    resp_step = int(resp.get("step", -1))
+                    server_ms = float(resp.get("server_ms", 0.0))
+                    if resp.get("ok") and resp_step == step:
                         action_raw = np.asarray(resp["action_raw"], dtype=np.float32)
                         last_safe_action = action_raw.copy()
                         net_ok_count += 1
+                        net_ok_step = True
                     else:
                         action_raw = last_safe_action.copy()
                         net_fallback_count += 1
+                        net_fallback_step = True
+                        net_error = f"bad_response_ok={resp.get('ok')}_step={resp_step}"
                         if (net_fallback_count <= 5) or (step % max(1, int(log_every)) == 0):
                             print(
                                 f"[RPI] fallback step={step}: resp_ok={resp.get('ok')} resp_step={resp.get('step')}"
                             )
-                except Exception:
+                except Exception as e:
                     # network timeout / decode error fallback
+                    request_ms = float((time.perf_counter() - request_t0) * 1000.0) if request_t0 is not None else 0.0
                     action_raw = last_safe_action.copy()
                     net_fallback_count += 1
+                    net_fallback_step = True
+                    net_error = type(e).__name__
                     if (net_fallback_count <= 5) or (step % max(1, int(log_every)) == 0):
                         print(f"[RPI] fallback step={step}: timeout/decode, using last_safe_action")
 
@@ -255,6 +274,12 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
                     f_actions.flush()
                     f_sd.flush()
 
+                control_dt_ms = float((time.perf_counter() - t_start) * 1000.0)
+                trajectory_history.append(obs_wo_cmd.copy())
+                while (time.perf_counter() - t_start) < TARGET_DT:
+                    pass
+                loop_dt_ms = float((time.perf_counter() - t_start) * 1000.0)
+
                 sd_writer.writerow(
                     {
                         "step": step,
@@ -264,6 +289,15 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
                         "exec_action_min": float(action_exec.min()),
                         "exec_action_max": float(action_exec.max()),
                         "exec_action_mean": float(action_exec.mean()),
+                        "net_ok": int(net_ok_step),
+                        "net_fallback": int(net_fallback_step),
+                        "net_error": net_error,
+                        "resp_step": int(resp_step),
+                        "server_ms": float(server_ms),
+                        "request_ms": float(request_ms),
+                        "control_dt_ms": float(control_dt_ms),
+                        "loop_dt_ms": float(loop_dt_ms),
+                        "timeout_ms": float(timeout_s * 1000.0),
                         "risk_level": int(risk_level),
                         "wm_error": float(risk_ema),
                         "contact_error": float(contact_error),
@@ -281,10 +315,6 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
                     }
                 )
 
-                trajectory_history.append(obs_wo_cmd.copy())
-                while (time.time() - t_start) < TARGET_DT:
-                    pass
-
                 candidate_selected = str(resp.get("candidate_selected", "nominal"))
                 candidate_group = str(resp.get("candidate_group", ""))
                 detected_bad_leg = int(resp.get("detected_bad_leg", -1))
@@ -301,6 +331,8 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
                     print(
                         f"[RPI] step={step} "
                         f"net_ok={net_ok_count} fallback={net_fallback_count} "
+                        f"resp_step={resp_step} server_ms={server_ms:.1f} request_ms={request_ms:.1f} "
+                        f"loop_dt={loop_dt_ms:.1f} "
                         f"raw[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
                         f"risk={risk_level} contact_anomaly={int(contact_anomaly)} contact_steps={contact_steps} "
                         f"det_bad_leg={detected_bad_leg} bad_leg={bad_leg} "
