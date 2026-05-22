@@ -155,7 +155,12 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
                     "server_ms", "request_ms", "control_dt_ms", "loop_dt_ms", "timeout_ms",
                     "risk_level", "wm_error", "contact_error", "contact_anomaly", "contact_steps",
                     "detected_bad_leg", "bad_leg", "candidate_selected", "candidate_group", "candidate_score",
-                    "forced_lift", "max_delta_before_filter",
+                    "effective_bad_leg", "effective_risk_level",
+                    "forced_lift", "forced_lift_reason",
+                    "recovery_latch_active", "recovery_latch_leg", "recovery_latch_hold",
+                    "recovery_latch_triggered", "recovery_latch_accepted",
+                    "lift_ankle_gain", "lift_knee_gain", "lift_knee_gain_ratio",
+                    "max_delta_before_filter",
                     "max_delta_after_filter", "ankle_delta_max",
                 ],
             )
@@ -308,7 +313,18 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
                         "candidate_selected": str(resp.get("candidate_selected", "nominal")),
                         "candidate_group": str(resp.get("candidate_group", "")),
                         "candidate_score": float(resp.get("candidate_score", 0.0)),
+                        "effective_bad_leg": int(resp.get("effective_bad_leg", resp.get("bad_leg", -1))),
+                        "effective_risk_level": int(resp.get("effective_risk_level", risk_level)),
                         "forced_lift": int(bool(resp.get("forced_lift", False))),
+                        "forced_lift_reason": str(resp.get("forced_lift_reason", "")),
+                        "recovery_latch_active": int(bool(resp.get("recovery_latch_active", False))),
+                        "recovery_latch_leg": int(resp.get("recovery_latch_leg", -1)),
+                        "recovery_latch_hold": int(resp.get("recovery_latch_hold", 0)),
+                        "recovery_latch_triggered": int(bool(resp.get("recovery_latch_triggered", False))),
+                        "recovery_latch_accepted": int(bool(resp.get("recovery_latch_accepted", False))),
+                        "lift_ankle_gain": float(resp.get("lift_ankle_gain", 0.0)),
+                        "lift_knee_gain": float(resp.get("lift_knee_gain", 0.0)),
+                        "lift_knee_gain_ratio": float(resp.get("lift_knee_gain_ratio", 0.0)),
                         "max_delta_before_filter": safety_dbg.get("max_delta_before_filter", 0.0),
                         "max_delta_after_filter": safety_dbg.get("max_delta_after_filter", 0.0),
                         "ankle_delta_max": safety_dbg.get("ankle_delta_max", 0.0),
@@ -319,6 +335,7 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
                 candidate_group = str(resp.get("candidate_group", ""))
                 detected_bad_leg = int(resp.get("detected_bad_leg", -1))
                 bad_leg = int(resp.get("bad_leg", -1))
+                effective_bad_leg = int(resp.get("effective_bad_leg", bad_leg))
                 event_key = (int(risk_level), int(contact_anomaly), bad_leg, candidate_selected)
                 event_active = (
                     risk_level > 0
@@ -335,9 +352,12 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
                         f"loop_dt={loop_dt_ms:.1f} "
                         f"raw[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
                         f"risk={risk_level} contact_anomaly={int(contact_anomaly)} contact_steps={contact_steps} "
-                        f"det_bad_leg={detected_bad_leg} bad_leg={bad_leg} "
+                        f"det_bad_leg={detected_bad_leg} bad_leg={bad_leg} eff_bad_leg={effective_bad_leg} "
                         f"cand={candidate_selected} group={candidate_group} "
                         f"forced_lift={int(bool(resp.get('forced_lift', False)))} "
+                        f"latch={int(bool(resp.get('recovery_latch_active', False)))} "
+                        f"latch_leg={int(resp.get('recovery_latch_leg', -1))} "
+                        f"hold={int(resp.get('recovery_latch_hold', 0))} "
                         f"err={contact_error:.4f} ema={risk_ema:.4f} "
                         f"dq_raw={np.degrees(float(safety_dbg.get('max_delta_before_filter', 0.0))):.2f}deg "
                         f"dq_exec={np.degrees(float(safety_dbg.get('max_delta_after_filter', 0.0))):.2f}deg"

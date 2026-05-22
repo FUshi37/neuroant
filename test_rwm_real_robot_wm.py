@@ -2743,7 +2743,12 @@ def test_rwm_real_robot_wm(model_path, enable_rate_limiter=True):
                     "exec_action_min", "exec_action_max", "exec_action_mean",
                     "risk_level", "wm_error", "contact_error", "contact_anomaly", "contact_steps",
                     "detected_bad_leg", "bad_leg", "candidate_selected", "candidate_group", "candidate_score",
-                    "forced_lift", "max_delta_before_filter",
+                    "effective_bad_leg", "effective_risk_level",
+                    "forced_lift", "forced_lift_reason",
+                    "recovery_latch_active", "recovery_latch_leg", "recovery_latch_hold",
+                    "recovery_latch_triggered", "recovery_latch_accepted",
+                    "lift_ankle_gain", "lift_knee_gain", "lift_knee_gain_ratio",
+                    "max_delta_before_filter",
                     "max_delta_after_filter", "ankle_delta_max",
                 ],
             )
@@ -3113,7 +3118,18 @@ def test_rwm_real_robot_wm(model_path, enable_rate_limiter=True):
                         "candidate_selected": candidate_selected,
                         "candidate_group": candidate_group,
                         "candidate_score": candidate_debug.get("score", 0.0),
+                        "effective_bad_leg": int(candidate_debug.get("effective_bad_leg", risk_state.bad_leg)),
+                        "effective_risk_level": int(candidate_debug.get("effective_risk_level", risk_state.level)),
                         "forced_lift": int(bool(candidate_debug.get("forced_lift", False))),
+                        "forced_lift_reason": candidate_debug.get("forced_lift_reason", ""),
+                        "recovery_latch_active": int(bool(candidate_debug.get("recovery_latch_active", False))),
+                        "recovery_latch_leg": int(candidate_debug.get("recovery_latch_leg", -1)),
+                        "recovery_latch_hold": int(candidate_debug.get("recovery_latch_hold", 0)),
+                        "recovery_latch_triggered": int(bool(candidate_debug.get("recovery_latch_triggered", False))),
+                        "recovery_latch_accepted": int(bool(candidate_debug.get("recovery_latch_accepted", False))),
+                        "lift_ankle_gain": float(candidate_debug.get("lift_ankle_gain", 0.0)),
+                        "lift_knee_gain": float(candidate_debug.get("lift_knee_gain", 0.0)),
+                        "lift_knee_gain_ratio": float(candidate_debug.get("lift_knee_gain_ratio", 0.0)),
                         "max_delta_before_filter": safety_dbg.get("max_delta_before_filter", 0.0),
                         "max_delta_after_filter": safety_dbg.get("max_delta_after_filter", 0.0),
                         "ankle_delta_max": safety_dbg.get("ankle_delta_max", 0.0),
@@ -3141,8 +3157,12 @@ def test_rwm_real_robot_wm(model_path, enable_rate_limiter=True):
                         f"contact_steps={int(detector_last_steps)} "
                         f"det_bad_leg={int(-1 if detected_bad_leg is None else detected_bad_leg)} "
                         f"bad_leg={int(risk_state.bad_leg)} "
+                        f"eff_bad_leg={int(candidate_debug.get('effective_bad_leg', risk_state.bad_leg))} "
                         f"cand={candidate_selected} group={candidate_group} "
                         f"forced_lift={int(bool(candidate_debug.get('forced_lift', False)))} "
+                        f"latch={int(bool(candidate_debug.get('recovery_latch_active', False)))} "
+                        f"latch_leg={int(candidate_debug.get('recovery_latch_leg', -1))} "
+                        f"hold={int(candidate_debug.get('recovery_latch_hold', 0))} "
                         f"score={candidate_debug.get('score', 0.0)} "
                         f"err={contact_error_value:.4f} ema={risk_state.ema_error:.4f} "
                         f"dq_raw={np.degrees(float(safety_dbg.get('max_delta_before_filter', 0.0))):.2f}deg "

@@ -75,6 +75,13 @@ def run_server(
         print("[PC][WARNING] WM candidate selector is DISABLED. Risk can only tighten the final rate limiter; no lift candidates will be selected.")
     else:
         print("[PC] WM candidate selector ENABLED: risk-coupled candidates and lift recovery are active.")
+        print(
+            "[PC] Lift recovery config: "
+            f"hold_steps={candidate_selector.recovery_hold_steps}, "
+            f"ankle_gain={candidate_selector.lift_ankle_gain_base:.3f}"
+            f"+{candidate_selector.lift_ankle_gain_per_risk:.3f}*risk, "
+            f"knee_ratio={candidate_selector.lift_knee_gain_ratio:.3f}"
+        )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((host, port))
@@ -98,7 +105,18 @@ def run_server(
             "risk_ema",
             "detected_bad_leg",
             "bad_leg",
+            "effective_bad_leg",
+            "effective_risk_level",
             "forced_lift",
+            "forced_lift_reason",
+            "recovery_latch_active",
+            "recovery_latch_leg",
+            "recovery_latch_hold",
+            "recovery_latch_triggered",
+            "recovery_latch_accepted",
+            "lift_ankle_gain",
+            "lift_knee_gain",
+            "lift_knee_gain_ratio",
             "horizon",
             "server_ms",
             "action_min",
@@ -228,10 +246,21 @@ def run_server(
                     "risk_baseline_std": float(risk_state.baseline_std),
                     "detected_bad_leg": int(-1 if detected_bad_leg is None else detected_bad_leg),
                     "bad_leg": int(risk_state.bad_leg),
+                    "effective_bad_leg": int(filter_debug.get("effective_bad_leg", risk_state.bad_leg)),
+                    "effective_risk_level": int(filter_debug.get("effective_risk_level", risk_state.level)),
                     "candidate_selected": str(filter_debug.get("selected", "nominal")),
                     "candidate_group": str(filter_debug.get("selected_group", "")),
                     "candidate_score": float(filter_debug.get("score", 0.0)) if isinstance(filter_debug.get("score", 0.0), (float, int)) else 0.0,
                     "forced_lift": bool(filter_debug.get("forced_lift", False)),
+                    "forced_lift_reason": str(filter_debug.get("forced_lift_reason", "")),
+                    "recovery_latch_active": bool(filter_debug.get("recovery_latch_active", False)),
+                    "recovery_latch_leg": int(filter_debug.get("recovery_latch_leg", -1)),
+                    "recovery_latch_hold": int(filter_debug.get("recovery_latch_hold", 0)),
+                    "recovery_latch_triggered": bool(filter_debug.get("recovery_latch_triggered", False)),
+                    "recovery_latch_accepted": bool(filter_debug.get("recovery_latch_accepted", False)),
+                    "lift_ankle_gain": float(filter_debug.get("lift_ankle_gain", 0.0)) if isinstance(filter_debug.get("lift_ankle_gain", 0.0), (float, int)) else 0.0,
+                    "lift_knee_gain": float(filter_debug.get("lift_knee_gain", 0.0)) if isinstance(filter_debug.get("lift_knee_gain", 0.0), (float, int)) else 0.0,
+                    "lift_knee_gain_ratio": float(filter_debug.get("lift_knee_gain_ratio", 0.0)) if isinstance(filter_debug.get("lift_knee_gain_ratio", 0.0), (float, int)) else 0.0,
                 }
                 packet_count += 1
 
@@ -247,7 +276,18 @@ def run_server(
                     "risk_ema": float(risk_state.ema_error),
                     "detected_bad_leg": int(-1 if detected_bad_leg is None else detected_bad_leg),
                     "bad_leg": int(risk_state.bad_leg),
+                    "effective_bad_leg": filter_debug.get("effective_bad_leg", risk_state.bad_leg),
+                    "effective_risk_level": filter_debug.get("effective_risk_level", risk_state.level),
                     "forced_lift": int(bool(filter_debug.get("forced_lift", False))),
+                    "forced_lift_reason": filter_debug.get("forced_lift_reason", ""),
+                    "recovery_latch_active": int(bool(filter_debug.get("recovery_latch_active", False))),
+                    "recovery_latch_leg": filter_debug.get("recovery_latch_leg", -1),
+                    "recovery_latch_hold": filter_debug.get("recovery_latch_hold", 0),
+                    "recovery_latch_triggered": int(bool(filter_debug.get("recovery_latch_triggered", False))),
+                    "recovery_latch_accepted": int(bool(filter_debug.get("recovery_latch_accepted", False))),
+                    "lift_ankle_gain": filter_debug.get("lift_ankle_gain", ""),
+                    "lift_knee_gain": filter_debug.get("lift_knee_gain", ""),
+                    "lift_knee_gain_ratio": filter_debug.get("lift_knee_gain_ratio", ""),
                     "horizon": 4,
                     "server_ms": server_ms,
                     "action_min": float(action_raw.min()),
@@ -282,13 +322,15 @@ def run_server(
                         f"server={server_ms:.2f}ms "
                         f"filter_used={row['filter_used']} cand={row['candidate_selected']} "
                         f"group={row['candidate_group']} forced_lift={row['forced_lift']} score={row['candidate_score']} "
+                        f"latch={row['recovery_latch_active']} latch_leg={row['recovery_latch_leg']} "
+                        f"latch_hold={row['recovery_latch_hold']} "
                         f"risk={risk_state.level} "
                         f"contact_enabled={int(anomaly_debug['enabled'])} "
                         f"contact_anomaly={int(anomaly_debug['is_anomaly'])} "
                         f"contact_error={anomaly_debug['error']} "
                         f"contact_steps={anomaly_debug['steps']} "
                         f"det_bad_leg={-1 if detected_bad_leg is None else detected_bad_leg} "
-                        f"bad_leg={risk_state.bad_leg}"
+                        f"bad_leg={risk_state.bad_leg} eff_bad_leg={row['effective_bad_leg']}"
                     )
             except Exception as e:
                 resp = {

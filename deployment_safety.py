@@ -43,6 +43,15 @@ RISK_FIXED_LEVEL2_THRESHOLD = 0.22
 BAD_LEG_TRACK_DECAY = 0.72
 BAD_LEG_TRACK_HOLD_STEPS = 8
 
+# Lift recovery candidates are expressed in normalized policy-action units
+# before the deployment action scale and servo angle limits are applied.
+LIFT_ANKLE_GAIN_BASE = 0.20#0.18
+LIFT_ANKLE_GAIN_PER_RISK = 0.08#0.07
+LIFT_KNEE_GAIN_RATIO = 0.8#0.35
+LIFT_RECOVERY_HOLD_STEPS = 16#12
+LIFT_RECOVERY_TRIGGER_RISK_LEVEL = 2
+LIFT_RECOVERY_TRIGGER_CONTACT_STEPS = 3
+
 # Simple right-front leg action offset.
 # Action order: [l1, l2, l3, r1, r2, r3], three joints per leg.
 # r1 knee = action[10], r1 ankle = action[11].
@@ -274,12 +283,27 @@ class SafetyActionFilter:
 
 
 class WorldModelCandidateSelector:
-    def __init__(self, world_model, action_dim: int = 18, horizon: int = 4, max_lift_candidates: int = 2, device: str = "cpu"):
+    def __init__(
+        self,
+        world_model,
+        action_dim: int = 18,
+        horizon: int = 4,
+        max_lift_candidates: int = 2,
+        device: str = "cpu",
+    ):
         self.world_model = world_model
         self.action_dim = int(action_dim)
         self.horizon = int(max(1, min(5, horizon)))
         self.max_lift_candidates = int(max(0, min(6, max_lift_candidates)))
         self.device = torch.device(device)
+        self.lift_ankle_gain_base = float(LIFT_ANKLE_GAIN_BASE)
+        self.lift_ankle_gain_per_risk = float(LIFT_ANKLE_GAIN_PER_RISK)
+        self.lift_knee_gain_ratio = float(LIFT_KNEE_GAIN_RATIO)
+        self.recovery_hold_steps = int(max(0, LIFT_RECOVERY_HOLD_STEPS))
+        self.recovery_leg = -1
+        self.recovery_hold = 0
+        self.recovery_last_triggered = False
+        self.recovery_last_accepted = False
         self.last_debug = {}
         self._select_count = 0
 
@@ -295,6 +319,12 @@ class WorldModelCandidateSelector:
             return -1
         leg = int(getattr(risk_state, "bad_leg", -1))
         return leg if 0 <= leg < 6 else -1
+
+    @staticmethod
+    def _contact_steps(risk_state: Optional[RiskState]) -> int:
+        if risk_state is None:
+            return 0
+        return int(max(0, int(getattr(risk_state, "contact_steps", 0))))
 
     @staticmethod
     def _candidate_group(name: str) -> str:
@@ -315,6 +345,34 @@ class WorldModelCandidateSelector:
         if risk_level == 1:
             return 0.65, 0.45, 0.70, 0.40
         return 0.75, 0.55, 0.60, 0.55
+
+    def _lift_gains(self, risk_level: int) -> Tuple[float, float]:
+        risk_level = int(max(0, min(2, risk_level)))
+        ankle_gain = self.lift_ankle_gain_base + self.lift_ankle_gain_per_risk * float(risk_level)
+        ankle_gain = float(max(0.0, min(1.0, ankle_gain)))
+        knee_gain = float(max(0.0, min(1.0, self.lift_knee_gain_ratio * ankle_gain)))
+        return ankle_gain, knee_gain
+
+    def _update_recovery_latch(self, risk_level: int, bad_leg: int, contact_steps: int) -> int:
+        triggered = (
+            self.recovery_hold_steps > 0
+            and risk_level >= LIFT_RECOVERY_TRIGGER_RISK_LEVEL
+            and bad_leg >= 0
+            and contact_steps >= LIFT_RECOVERY_TRIGGER_CONTACT_STEPS
+        )
+        accepted = False
+        if triggered and (self.recovery_hold <= 0 or self.recovery_leg < 0 or bad_leg == self.recovery_leg):
+            self.recovery_leg = int(bad_leg)
+            self.recovery_hold = self.recovery_hold_steps
+            accepted = True
+        elif self.recovery_hold > 0:
+            self.recovery_hold -= 1
+            if self.recovery_hold <= 0:
+                self.recovery_leg = -1
+
+        self.recovery_last_triggered = bool(triggered)
+        self.recovery_last_accepted = bool(accepted)
+        return int(self.recovery_leg if self.recovery_hold > 0 else -1)
 
     def _ensure_2d(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 1:
@@ -347,8 +405,7 @@ class WorldModelCandidateSelector:
         # Positive lift direction differs between left and right legs in the
         # normalized policy/action coordinates. Keep the candidate construction
         # in the same sim-aligned convention used by the hardware mapper.
-        ankle_gain = 0.18 + 0.07 * float(risk_level)
-        knee_gain = 0.35 * ankle_gain
+        ankle_gain, knee_gain = self._lift_gains(risk_level)
         out = nominal.clone()
         out[..., ankle] = out[..., ankle] + ankle_gain * float(LIFT_DIR[leg_id])
         out[..., knee] = out[..., knee] + knee_gain * float(KNEE_LIFT_DIR[leg_id])
@@ -359,9 +416,15 @@ class WorldModelCandidateSelector:
         nominal: torch.Tensor,
         prev_action: Optional[torch.Tensor],
         risk_state: Optional[RiskState] = None,
+        risk_level_override: Optional[int] = None,
+        bad_leg_override: Optional[int] = None,
     ) -> List[Tuple[str, torch.Tensor]]:
-        risk_level = self._risk_level(risk_state)
-        bad_leg = self._bad_leg(risk_state)
+        risk_level = self._risk_level(risk_state) if risk_level_override is None else int(max(0, min(2, risk_level_override)))
+        if bad_leg_override is None:
+            bad_leg = self._bad_leg(risk_state)
+        else:
+            leg = int(bad_leg_override)
+            bad_leg = leg if 0 <= leg < 6 else -1
         scale_1, scale_2, blend_prev_gain, ankle_gain = self._risk_scales(risk_level)
 
         cands: List[Tuple[str, torch.Tensor]] = []
@@ -404,7 +467,19 @@ class WorldModelCandidateSelector:
             self._select_count += 1
             risk_level = self._risk_level(risk_state)
             bad_leg = self._bad_leg(risk_state)
-            candidates = self._build_candidates(nominal, prev, risk_state)
+            contact_steps = self._contact_steps(risk_state)
+            latched_leg = self._update_recovery_latch(risk_level, bad_leg, contact_steps)
+            latch_active = latched_leg >= 0 and self.recovery_hold > 0
+            effective_bad_leg = int(latched_leg if latch_active else bad_leg)
+            effective_risk_level = int(max(risk_level, LIFT_RECOVERY_TRIGGER_RISK_LEVEL if latch_active else 0))
+
+            candidates = self._build_candidates(
+                nominal,
+                prev,
+                risk_state,
+                risk_level_override=effective_risk_level,
+                bad_leg_override=effective_bad_leg,
+            )
             names = [n for n, _ in candidates]
             cand_t = torch.cat([c for _, c in candidates], dim=0)
 
@@ -419,7 +494,7 @@ class WorldModelCandidateSelector:
             is_first_b = is_first.reshape(-1).to(self.device, dtype=torch.float32).repeat_interleave(n)
 
             score = torch.zeros(n, device=self.device)
-            ang_weight = 0.35 * (1.0 + 0.25 * float(risk_level))
+            ang_weight = 0.35 * (1.0 + 0.25 * float(effective_risk_level))
             for _ in range(self.horizon):
                 latent = dynamics.img_step(latent, cand_rssm, sample=True) if hasattr(dynamics, "img_step") else dynamics.imagine_with_action(latent, cand_rssm)
                 pred_prop = self._decode_prop(latent)
@@ -432,8 +507,8 @@ class WorldModelCandidateSelector:
 
             if prev is not None:
                 prev_rep = prev.repeat(n, 1)
-                smooth_weight = 0.08 * (1.0 + 0.75 * float(risk_level))
-                ankle_delta_weight = 0.04 * float(risk_level)
+                smooth_weight = 0.08 * (1.0 + 0.75 * float(effective_risk_level))
+                ankle_delta_weight = 0.04 * float(effective_risk_level)
                 score = score + smooth_weight * torch.norm(cand_t - prev_rep, dim=-1)
                 score = score + ankle_delta_weight * torch.norm((cand_t - prev_rep)[:, ANKLE_INDEX_LIST], dim=-1)
 
@@ -441,44 +516,52 @@ class WorldModelCandidateSelector:
             ankle = cand_t[:, ANKLE_INDEX_LIST]
             aligned_ankle = ankle * lift_dir_t
             down_motion = torch.relu(-aligned_ankle)
-            ankle_weight = 0.15 * (1.0 + 0.80 * float(risk_level))
-            down_weight = 0.10 * float(risk_level)
+            ankle_weight = 0.15 * (1.0 + 0.80 * float(effective_risk_level))
+            down_weight = 0.10 * float(effective_risk_level)
             score = score + ankle_weight * torch.norm(ankle, dim=-1)
             score = score + down_weight * torch.norm(down_motion, dim=-1)
 
-            if risk_level > 0:
+            if effective_risk_level > 0:
                 bias = torch.zeros(n, device=self.device, dtype=score.dtype)
                 for idx, name in enumerate(names):
                     if name == "nominal":
-                        bias[idx] += 0.15 * float(risk_level)
+                        bias[idx] += 0.15 * float(effective_risk_level)
                     if name.startswith("lift_leg_"):
                         try:
                             leg_id = int(name.rsplit("_", 1)[-1])
                         except Exception:
                             leg_id = -1
-                        if bad_leg >= 0 and leg_id == bad_leg:
-                            bias[idx] -= 0.45 * float(risk_level)
-                        elif bad_leg >= 0:
-                            bias[idx] += 0.08 * float(risk_level)
+                        if effective_bad_leg >= 0 and leg_id == effective_bad_leg:
+                            bias[idx] -= 0.45 * float(effective_risk_level)
+                        elif effective_bad_leg >= 0:
+                            bias[idx] += 0.08 * float(effective_risk_level)
                 score = score + bias
 
             forced_lift = False
             forced_lift_name = ""
+            forced_lift_reason = ""
             if (
                 self._select_count >= 20
-                and risk_level >= 2
-                and bad_leg >= 0
-                and int(getattr(risk_state, "contact_steps", 0)) >= 3
+                and effective_bad_leg >= 0
+                and (
+                    latch_active
+                    or (
+                        risk_level >= LIFT_RECOVERY_TRIGGER_RISK_LEVEL
+                        and contact_steps >= LIFT_RECOVERY_TRIGGER_CONTACT_STEPS
+                    )
+                )
             ):
-                target_name = f"lift_leg_{bad_leg}"
+                target_name = f"lift_leg_{effective_bad_leg}"
                 if target_name in names:
                     best_idx = int(names.index(target_name))
                     forced_lift = True
                     forced_lift_name = target_name
+                    forced_lift_reason = "recovery_latch" if latch_active else "risk_trigger"
                 else:
                     best_idx = int(torch.argmin(score).detach().cpu().item())
             else:
                 best_idx = int(torch.argmin(score).detach().cpu().item())
+            lift_ankle_gain, lift_knee_gain = self._lift_gains(effective_risk_level)
             self.last_debug = {
                 "selected": names[best_idx],
                 "selected_group": self._candidate_group(names[best_idx]),
@@ -487,9 +570,21 @@ class WorldModelCandidateSelector:
                 "num_candidates": int(n),
                 "used": bool(best_idx != 0),
                 "risk_level": int(risk_level),
+                "effective_risk_level": int(effective_risk_level),
                 "bad_leg": int(bad_leg),
+                "effective_bad_leg": int(effective_bad_leg),
                 "forced_lift": bool(forced_lift),
                 "forced_lift_name": forced_lift_name,
+                "forced_lift_reason": forced_lift_reason,
+                "recovery_latch_active": bool(latch_active),
+                "recovery_latch_leg": int(latched_leg),
+                "recovery_latch_hold": int(self.recovery_hold),
+                "recovery_latch_triggered": bool(self.recovery_last_triggered),
+                "recovery_latch_accepted": bool(self.recovery_last_accepted),
+                "recovery_hold_steps": int(self.recovery_hold_steps),
+                "lift_ankle_gain": float(lift_ankle_gain),
+                "lift_knee_gain": float(lift_knee_gain),
+                "lift_knee_gain_ratio": float(self.lift_knee_gain_ratio),
                 "select_count": int(self._select_count),
                 "ankle_weight": float(ankle_weight),
                 "down_weight": float(down_weight),
