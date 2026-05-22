@@ -78,9 +78,9 @@ def run_server(
         print(
             "[PC] Lift recovery config: "
             f"hold_steps={candidate_selector.recovery_hold_steps}, "
-            f"ankle_gain={candidate_selector.lift_ankle_gain_base:.3f}"
-            f"+{candidate_selector.lift_ankle_gain_per_risk:.3f}*risk, "
-            f"knee_ratio={candidate_selector.lift_knee_gain_ratio:.3f}"
+            f"hip_target={candidate_selector.lift_hip_forward_target:.3f}, "
+            f"knee_target={candidate_selector.lift_knee_target:.3f}, "
+            f"ankle_target={candidate_selector.lift_ankle_target:.3f}"
         )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -114,9 +114,14 @@ def run_server(
             "recovery_latch_hold",
             "recovery_latch_triggered",
             "recovery_latch_accepted",
-            "lift_ankle_gain",
-            "lift_knee_gain",
-            "lift_knee_gain_ratio",
+            "lift_hip_forward_target",
+            "lift_hip_forward_blend",
+            "lift_knee_final_target",
+            "lift_knee_raw_target",
+            "lift_knee_blend",
+            "lift_ankle_final_target",
+            "lift_ankle_raw_target",
+            "lift_ankle_blend",
             "horizon",
             "server_ms",
             "action_min",
@@ -258,9 +263,14 @@ def run_server(
                     "recovery_latch_hold": int(filter_debug.get("recovery_latch_hold", 0)),
                     "recovery_latch_triggered": bool(filter_debug.get("recovery_latch_triggered", False)),
                     "recovery_latch_accepted": bool(filter_debug.get("recovery_latch_accepted", False)),
-                    "lift_ankle_gain": float(filter_debug.get("lift_ankle_gain", 0.0)) if isinstance(filter_debug.get("lift_ankle_gain", 0.0), (float, int)) else 0.0,
-                    "lift_knee_gain": float(filter_debug.get("lift_knee_gain", 0.0)) if isinstance(filter_debug.get("lift_knee_gain", 0.0), (float, int)) else 0.0,
-                    "lift_knee_gain_ratio": float(filter_debug.get("lift_knee_gain_ratio", 0.0)) if isinstance(filter_debug.get("lift_knee_gain_ratio", 0.0), (float, int)) else 0.0,
+                    "lift_hip_forward_target": float(filter_debug.get("lift_hip_forward_target", 0.0)) if isinstance(filter_debug.get("lift_hip_forward_target", 0.0), (float, int)) else 0.0,
+                    "lift_hip_forward_blend": float(filter_debug.get("lift_hip_forward_blend", 0.0)) if isinstance(filter_debug.get("lift_hip_forward_blend", 0.0), (float, int)) else 0.0,
+                    "lift_knee_final_target": float(filter_debug.get("lift_knee_final_target", 0.0)) if isinstance(filter_debug.get("lift_knee_final_target", 0.0), (float, int)) else 0.0,
+                    "lift_knee_raw_target": float(filter_debug.get("lift_knee_raw_target", 0.0)) if isinstance(filter_debug.get("lift_knee_raw_target", 0.0), (float, int)) else 0.0,
+                    "lift_knee_blend": float(filter_debug.get("lift_knee_blend", 0.0)) if isinstance(filter_debug.get("lift_knee_blend", 0.0), (float, int)) else 0.0,
+                    "lift_ankle_final_target": float(filter_debug.get("lift_ankle_final_target", 0.0)) if isinstance(filter_debug.get("lift_ankle_final_target", 0.0), (float, int)) else 0.0,
+                    "lift_ankle_raw_target": float(filter_debug.get("lift_ankle_raw_target", 0.0)) if isinstance(filter_debug.get("lift_ankle_raw_target", 0.0), (float, int)) else 0.0,
+                    "lift_ankle_blend": float(filter_debug.get("lift_ankle_blend", 0.0)) if isinstance(filter_debug.get("lift_ankle_blend", 0.0), (float, int)) else 0.0,
                 }
                 packet_count += 1
 
@@ -285,9 +295,14 @@ def run_server(
                     "recovery_latch_hold": filter_debug.get("recovery_latch_hold", 0),
                     "recovery_latch_triggered": int(bool(filter_debug.get("recovery_latch_triggered", False))),
                     "recovery_latch_accepted": int(bool(filter_debug.get("recovery_latch_accepted", False))),
-                    "lift_ankle_gain": filter_debug.get("lift_ankle_gain", ""),
-                    "lift_knee_gain": filter_debug.get("lift_knee_gain", ""),
-                    "lift_knee_gain_ratio": filter_debug.get("lift_knee_gain_ratio", ""),
+                    "lift_hip_forward_target": filter_debug.get("lift_hip_forward_target", ""),
+                    "lift_hip_forward_blend": filter_debug.get("lift_hip_forward_blend", ""),
+                    "lift_knee_final_target": filter_debug.get("lift_knee_final_target", ""),
+                    "lift_knee_raw_target": filter_debug.get("lift_knee_raw_target", ""),
+                    "lift_knee_blend": filter_debug.get("lift_knee_blend", ""),
+                    "lift_ankle_final_target": filter_debug.get("lift_ankle_final_target", ""),
+                    "lift_ankle_raw_target": filter_debug.get("lift_ankle_raw_target", ""),
+                    "lift_ankle_blend": filter_debug.get("lift_ankle_blend", ""),
                     "horizon": 4,
                     "server_ms": server_ms,
                     "action_min": float(action_raw.min()),

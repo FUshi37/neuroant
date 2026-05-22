@@ -8,13 +8,18 @@ import torch
 
 ANKLE_INDEX_LIST = [2, 5, 8, 11, 14, 17]
 KNEE_INDEX_LIST = [1, 4, 7, 10, 13, 16]
+# Policy/action leg order is [l1, l2, l3, r1, r2, r3], not servo order.
+# These directions convert the desired physical-positive direction into the
+# normalized action sign used by action_to_servo_angles().
 LIFT_DIR_LIST = [1, 1, 1, -1, -1, -1]
-KNEE_LIFT_DIR_LIST = [-1, -1, -1, 1, 1, 1]
+KNEE_LIFT_DIR_LIST = [1, 1, 1, -1, -1, -1]
+HIP_FORWARD_DIR_LIST = [1, 1, 1, -1, -1, -1]
 
 ANKLE_INDICES = np.array(ANKLE_INDEX_LIST, dtype=np.int64)
 LIFT_DIR = np.array(LIFT_DIR_LIST, dtype=np.float32)
 KNEE_INDICES = np.array(KNEE_INDEX_LIST, dtype=np.int64)
 KNEE_LIFT_DIR = np.array(KNEE_LIFT_DIR_LIST, dtype=np.float32)
+HIP_FORWARD_DIR = np.array(HIP_FORWARD_DIR_LIST, dtype=np.float32)
 
 
 # Deployment-side execution scale (rad per normalized action unit).
@@ -45,10 +50,13 @@ BAD_LEG_TRACK_HOLD_STEPS = 8
 
 # Lift recovery candidates are expressed in normalized policy-action units
 # before the deployment action scale and servo angle limits are applied.
-LIFT_ANKLE_GAIN_BASE = 0.20#0.18
-LIFT_ANKLE_GAIN_PER_RISK = 0.08#0.07
-LIFT_KNEE_GAIN_RATIO = 0.8#0.35
-LIFT_RECOVERY_HOLD_STEPS = 16#12
+LIFT_HIP_FORWARD_TARGET_ACTION = 0.55
+LIFT_HIP_FORWARD_BLEND = 0.85
+LIFT_KNEE_TARGET_ACTION = 0.95
+LIFT_KNEE_TARGET_BLEND = 0.95
+LIFT_ANKLE_TARGET_ACTION = 0.0
+LIFT_ANKLE_TARGET_BLEND = 0.90
+LIFT_RECOVERY_HOLD_STEPS = 16
 LIFT_RECOVERY_TRIGGER_RISK_LEVEL = 2
 LIFT_RECOVERY_TRIGGER_CONTACT_STEPS = 3
 
@@ -57,8 +65,8 @@ LIFT_RECOVERY_TRIGGER_CONTACT_STEPS = 3
 # r1 knee = action[10], r1 ankle = action[11].
 # For the right-front leg, larger knee action and smaller ankle action lift the foot.
 RIGHT_FRONT_ACTION_OFFSET_ENABLED = True
-RIGHT_FRONT_KNEE_ACTION_OFFSET = 0.35
-RIGHT_FRONT_ANKLE_ACTION_OFFSET = -0.55
+RIGHT_FRONT_KNEE_ACTION_OFFSET = 0.0
+RIGHT_FRONT_ANKLE_ACTION_OFFSET = 0.0
 
 
 def default_action_scale_per_dim() -> np.ndarray:
@@ -296,9 +304,12 @@ class WorldModelCandidateSelector:
         self.horizon = int(max(1, min(5, horizon)))
         self.max_lift_candidates = int(max(0, min(6, max_lift_candidates)))
         self.device = torch.device(device)
-        self.lift_ankle_gain_base = float(LIFT_ANKLE_GAIN_BASE)
-        self.lift_ankle_gain_per_risk = float(LIFT_ANKLE_GAIN_PER_RISK)
-        self.lift_knee_gain_ratio = float(LIFT_KNEE_GAIN_RATIO)
+        self.lift_hip_forward_target = float(LIFT_HIP_FORWARD_TARGET_ACTION)
+        self.lift_hip_forward_blend = float(LIFT_HIP_FORWARD_BLEND)
+        self.lift_knee_target = float(LIFT_KNEE_TARGET_ACTION)
+        self.lift_knee_blend = float(LIFT_KNEE_TARGET_BLEND)
+        self.lift_ankle_target = float(LIFT_ANKLE_TARGET_ACTION)
+        self.lift_ankle_blend = float(LIFT_ANKLE_TARGET_BLEND)
         self.recovery_hold_steps = int(max(0, LIFT_RECOVERY_HOLD_STEPS))
         self.recovery_leg = -1
         self.recovery_hold = 0
@@ -346,12 +357,35 @@ class WorldModelCandidateSelector:
             return 0.65, 0.45, 0.70, 0.40
         return 0.75, 0.55, 0.60, 0.55
 
-    def _lift_gains(self, risk_level: int) -> Tuple[float, float]:
-        risk_level = int(max(0, min(2, risk_level)))
-        ankle_gain = self.lift_ankle_gain_base + self.lift_ankle_gain_per_risk * float(risk_level)
-        ankle_gain = float(max(0.0, min(1.0, ankle_gain)))
-        knee_gain = float(max(0.0, min(1.0, self.lift_knee_gain_ratio * ankle_gain)))
-        return ankle_gain, knee_gain
+    @staticmethod
+    def _blend01(value: float) -> float:
+        return float(max(0.0, min(1.0, value)))
+
+    @staticmethod
+    def _fixed_raw_offset(leg_id: int, joint_offset: int) -> float:
+        if RIGHT_FRONT_ACTION_OFFSET_ENABLED and int(leg_id) == 3:
+            if int(joint_offset) == 1:
+                return float(RIGHT_FRONT_KNEE_ACTION_OFFSET)
+            if int(joint_offset) == 2:
+                return float(RIGHT_FRONT_ANKLE_ACTION_OFFSET)
+        return 0.0
+
+    def _lift_pose_debug(self, leg_id: int) -> Dict[str, float]:
+        leg_id = int(max(0, min(5, leg_id)))
+        hip_target = float(np.clip(self.lift_hip_forward_target * HIP_FORWARD_DIR[leg_id], -1.0, 1.0))
+        knee_final_target = float(np.clip(self.lift_knee_target * KNEE_LIFT_DIR[leg_id], -1.0, 1.0))
+        knee_raw_target = float(np.clip(knee_final_target - self._fixed_raw_offset(leg_id, 1), -1.0, 1.0))
+        ankle_raw_target = float(np.clip(self.lift_ankle_target - self._fixed_raw_offset(leg_id, 2), -1.0, 1.0))
+        return {
+            "lift_hip_forward_target": hip_target,
+            "lift_hip_forward_blend": self._blend01(self.lift_hip_forward_blend),
+            "lift_knee_final_target": knee_final_target,
+            "lift_knee_raw_target": knee_raw_target,
+            "lift_knee_blend": self._blend01(self.lift_knee_blend),
+            "lift_ankle_final_target": float(np.clip(self.lift_ankle_target, -1.0, 1.0)),
+            "lift_ankle_raw_target": ankle_raw_target,
+            "lift_ankle_blend": self._blend01(self.lift_ankle_blend),
+        }
 
     def _update_recovery_latch(self, risk_level: int, bad_leg: int, contact_steps: int) -> int:
         triggered = (
@@ -400,15 +434,40 @@ class WorldModelCandidateSelector:
     def _lift_candidate(self, nominal: torch.Tensor, leg_id: int, risk_level: int) -> torch.Tensor:
         leg_id = int(max(0, min(5, leg_id)))
         base = leg_id * 3
+        hip = base
         knee = base + 1
         ankle = base + 2
-        # Positive lift direction differs between left and right legs in the
-        # normalized policy/action coordinates. Keep the candidate construction
-        # in the same sim-aligned convention used by the hardware mapper.
-        ankle_gain, knee_gain = self._lift_gains(risk_level)
         out = nominal.clone()
-        out[..., ankle] = out[..., ankle] + ankle_gain * float(LIFT_DIR[leg_id])
-        out[..., knee] = out[..., knee] + knee_gain * float(KNEE_LIFT_DIR[leg_id])
+
+        pose = self._lift_pose_debug(leg_id)
+
+        hip_dir = float(HIP_FORWARD_DIR[leg_id])
+        hip_target = float(pose["lift_hip_forward_target"])
+        hip_blend = float(pose["lift_hip_forward_blend"])
+        hip_aligned = out[..., hip] * hip_dir
+        hip_target_aligned = abs(hip_target)
+        hip_next_aligned = hip_aligned + hip_blend * (hip_target_aligned - hip_aligned)
+        out[..., hip] = torch.where(
+            hip_aligned < hip_target_aligned,
+            hip_next_aligned * hip_dir,
+            out[..., hip],
+        )
+
+        knee_dir = float(KNEE_LIFT_DIR[leg_id])
+        knee_target = float(pose["lift_knee_raw_target"])
+        knee_blend = float(pose["lift_knee_blend"])
+        knee_aligned = out[..., knee] * knee_dir
+        knee_target_aligned = knee_target * knee_dir
+        knee_next_aligned = knee_aligned + knee_blend * (knee_target_aligned - knee_aligned)
+        out[..., knee] = torch.where(
+            knee_aligned < knee_target_aligned,
+            knee_next_aligned * knee_dir,
+            out[..., knee],
+        )
+
+        ankle_target = float(pose["lift_ankle_raw_target"])
+        ankle_blend = float(pose["lift_ankle_blend"])
+        out[..., ankle] = out[..., ankle] + ankle_blend * (ankle_target - out[..., ankle])
         return torch.clamp(out, -1.0, 1.0)
 
     def _build_candidates(
@@ -561,7 +620,7 @@ class WorldModelCandidateSelector:
                     best_idx = int(torch.argmin(score).detach().cpu().item())
             else:
                 best_idx = int(torch.argmin(score).detach().cpu().item())
-            lift_ankle_gain, lift_knee_gain = self._lift_gains(effective_risk_level)
+            lift_pose = self._lift_pose_debug(effective_bad_leg if effective_bad_leg >= 0 else 3)
             self.last_debug = {
                 "selected": names[best_idx],
                 "selected_group": self._candidate_group(names[best_idx]),
@@ -582,9 +641,7 @@ class WorldModelCandidateSelector:
                 "recovery_latch_triggered": bool(self.recovery_last_triggered),
                 "recovery_latch_accepted": bool(self.recovery_last_accepted),
                 "recovery_hold_steps": int(self.recovery_hold_steps),
-                "lift_ankle_gain": float(lift_ankle_gain),
-                "lift_knee_gain": float(lift_knee_gain),
-                "lift_knee_gain_ratio": float(self.lift_knee_gain_ratio),
+                **lift_pose,
                 "select_count": int(self._select_count),
                 "ankle_weight": float(ankle_weight),
                 "down_weight": float(down_weight),
