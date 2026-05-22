@@ -254,6 +254,24 @@ class SafetyActionFilter:
         }
         return out, dbg
 
+    def bypass(self, action_exec_desired: np.ndarray) -> Tuple[np.ndarray, Dict[str, float]]:
+        desired = np.asarray(action_exec_desired, dtype=np.float32).copy()
+        desired = np.clip(desired, self.action_limits["min"], self.action_limits["max"])
+        if self.prev_exec is None:
+            self.reset(desired)
+        assert self.prev_exec is not None
+
+        raw_delta = desired - self.prev_exec
+        self.prev_delta = raw_delta.copy()
+        self.prev_exec = desired.copy()
+
+        max_delta = float(np.max(np.abs(raw_delta)))
+        return desired, {
+            "max_delta_before_filter": max_delta,
+            "max_delta_after_filter": max_delta,
+            "ankle_delta_max": float(np.max(np.abs(raw_delta[ANKLE_INDICES]))),
+        }
+
 
 class WorldModelCandidateSelector:
     def __init__(self, world_model, action_dim: int = 18, horizon: int = 4, max_lift_candidates: int = 2, device: str = "cpu"):

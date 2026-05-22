@@ -2491,7 +2491,7 @@ def run_replay_sim_dof(sim_data_path=None):
     print(f"Replay finished. Logs saved to {output_dir}/")
 
 
-def test_rwm_real_robot_wm(model_path):
+def test_rwm_real_robot_wm(model_path, enable_rate_limiter=True):
     """Test RWM on real robot - simplified for deployment"""
     
     print("\n" + "="*60)
@@ -2535,6 +2535,7 @@ def test_rwm_real_robot_wm(model_path):
         f"knee[10]+={RIGHT_FRONT_KNEE_ACTION_OFFSET:.2f}, "
         f"ankle[11]+={RIGHT_FRONT_ANKLE_ACTION_OFFSET:.2f}"
     )
+    print(f"Rate limiter: {'ENABLED' if enable_rate_limiter else 'DISABLED'}")
 
     # Initialize real robot components
     print("📍 Step 1: Initializing Servos...")
@@ -2923,7 +2924,10 @@ def test_rwm_real_robot_wm(model_path):
                     asym_sink_range_rad=ASYM_ANKLE_SINK_RANGE_RAD,
                 )
                 action_exec_desired = np.clip(action_exec_desired, action_limits['min'], action_limits['max'])
-                action_limited, safety_dbg = safety_filter.filter(action_exec_desired, risk_state.level)
+                if enable_rate_limiter:
+                    action_limited, safety_dbg = safety_filter.filter(action_exec_desired, risk_state.level)
+                else:
+                    action_limited, safety_dbg = safety_filter.bypass(action_exec_desired)
 
                 # Check if any actions were clipped
                 action_clipped = np.any(action_exec_desired != action_limited)
@@ -3441,6 +3445,9 @@ def verify_safety():
 
 if __name__ == '__main__':
     import sys
+    disable_rate_limiter = '--disable-rate-limiter' in sys.argv
+    if disable_rate_limiter:
+        sys.argv = [arg for arg in sys.argv if arg != '--disable-rate-limiter']
     remote_ip = None
     remote_port = 9876
     if '--remote-wm-server-ip' in sys.argv:
@@ -3462,7 +3469,13 @@ if __name__ == '__main__':
     if remote_ip is not None:
         from rpi_robot_client import run_client
         print(f"Running remote WM client mode -> {remote_ip}:{remote_port}")
-        run_client(remote_ip, remote_port, timeout_s=0.05, log_every=50)
+        run_client(
+            remote_ip,
+            remote_port,
+            timeout_s=0.05,
+            log_every=50,
+            enable_rate_limiter=not disable_rate_limiter,
+        )
         sys.exit(0)
 
     # PC server mode for convenience. This reuses the dedicated UDP server implementation.
@@ -3510,7 +3523,7 @@ if __name__ == '__main__':
             sim_path = sys.argv[2] if len(sys.argv) > 2 else None
             run_replay_sim_dof(sim_path)
         else:
-            print("Usage: python test_rwm_real_robot_wm.py [--verify|--verify-limits|--verify-mapping|--verify-safety|--imu-test|--replay-sim-dof [sim_data_path]|--remote-wm-server-ip <PC_IP> [--remote-wm-server-port <PORT>]|--pc-wm-server [--model-path PATH] [--host HOST] [--port PORT] [--remove-dof-vel] [--use-stability-filter]]")
+            print("Usage: python test_rwm_real_robot_wm.py [--disable-rate-limiter] [--verify|--verify-limits|--verify-mapping|--verify-safety|--imu-test|--replay-sim-dof [sim_data_path]|--remote-wm-server-ip <PC_IP> [--remote-wm-server-port <PORT>]|--pc-wm-server [--model-path PATH] [--host HOST] [--port PORT] [--remove-dof-vel] [--use-stability-filter]]")
     else:
         # Path to your trained RWM model checkpoint
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -3525,4 +3538,4 @@ if __name__ == '__main__':
         # model_path = os.path.join(current_dir, 'world_model', 'model_9500.pt')
 
         print(f"Loading model from: {model_path}")
-        test_rwm_real_robot_wm(model_path)
+        test_rwm_real_robot_wm(model_path, enable_rate_limiter=not disable_rate_limiter)

@@ -72,7 +72,7 @@ def _request_action(sock, server_addr, step, obs, history, prev_action, timeout_
     raise TimeoutError(f"no matched response for step={step}")
 
 
-def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
+def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate_limiter=True):
     if HARDWARE_IMPORT_ERROR is not None:
         raise RuntimeError(f"hardware import failed: {HARDWARE_IMPORT_ERROR}")
 
@@ -117,6 +117,7 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
         f"knee[10]+={RIGHT_FRONT_KNEE_ACTION_OFFSET:.2f}, "
         f"ankle[11]+={RIGHT_FRONT_ANKLE_ACTION_OFFSET:.2f}"
     )
+    print(f"[RPI] Rate limiter: {'ENABLED' if enable_rate_limiter else 'DISABLED'}")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server_addr = (server_ip, server_port)
@@ -225,7 +226,10 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50):
                     asym_sink_range_rad=ASYM_ANKLE_SINK_RANGE_RAD,
                 )
                 action_exec_desired = np.clip(action_exec_desired, action_limits["min"], action_limits["max"])
-                action_exec, safety_dbg = safety_filter.filter(action_exec_desired, risk_level)
+                if enable_rate_limiter:
+                    action_exec, safety_dbg = safety_filter.filter(action_exec_desired, risk_level)
+                else:
+                    action_exec, safety_dbg = safety_filter.bypass(action_exec_desired)
                 if USE_ADMITTANCE:
                     if admittance_needs_init:
                         current_sim_angles = servo_angles_to_sim_angles(position_read)
@@ -330,12 +334,18 @@ def main():
     parser.add_argument("--server-port", type=int, default=9876)
     parser.add_argument("--timeout-ms", type=float, default=50.0)
     parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument(
+        "--disable-rate-limiter",
+        action="store_true",
+        help="Bypass the deployment-side command rate limiter while keeping angle limits and logging.",
+    )
     args = parser.parse_args()
     run_client(
         args.server_ip,
         args.server_port,
         timeout_s=max(0.001, args.timeout_ms / 1000.0),
         log_every=args.log_every,
+        enable_rate_limiter=not args.disable_rate_limiter,
     )
 
 
