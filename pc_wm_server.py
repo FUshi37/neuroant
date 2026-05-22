@@ -9,8 +9,13 @@ import time
 import numpy as np
 import torch
 
-# On Windows hosts without MSVC, force eager mode before importing WM modules.
-if os.name == "nt":
+# Keep the real-robot PC server on stable eager CUDA. torch.compile on Windows/CUDA
+# often requires Triton, which is commonly unavailable and causes safe-action fallback.
+PC_DISABLE_TORCH_COMPILE = True
+if PC_DISABLE_TORCH_COMPILE:
+    os.environ["DISABLE_TORCH_COMPILE"] = "1"
+    print("[PC] forcing eager mode (DISABLE_TORCH_COMPILE=1)")
+elif os.name == "nt":
     has_cl = (shutil.which("cl") is not None) or (shutil.which("cl.exe") is not None)
     if not has_cl:
         os.environ["DISABLE_TORCH_COMPILE"] = "1"
@@ -28,6 +33,32 @@ from test_rwm_real_robot_wm import (
 from deployment_safety import BadLegTracker, RiskLevelEstimator, WorldModelCandidateSelector
 
 
+PC_WM_DEVICE = "auto"  # "auto", "cuda", "cuda:0", or "cpu"
+PC_ENABLE_TF32 = True
+PC_CANDIDATE_HORIZON = 4
+
+
+def _select_torch_device():
+    requested = str(PC_WM_DEVICE).strip().lower()
+    if requested == "auto":
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    elif requested.startswith("cuda") and not torch.cuda.is_available():
+        print(f"[PC][WARNING] CUDA requested by PC_WM_DEVICE={PC_WM_DEVICE!r}, but torch.cuda.is_available() is false. Falling back to CPU.")
+        device = torch.device("cpu")
+    else:
+        device = torch.device(requested)
+
+    if device.type == "cuda":
+        if PC_ENABLE_TF32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        device_name = torch.cuda.get_device_name(device.index if device.index is not None else 0)
+        print(f"[PC] torch device: {device} ({device_name}), tf32={int(PC_ENABLE_TF32)}")
+    else:
+        print("[PC] torch device: cpu")
+    return device
+
+
 def _to_float_list(arr):
     return [float(x) for x in np.asarray(arr, dtype=np.float32).reshape(-1)]
 
@@ -43,15 +74,16 @@ def run_server(
     log_contact_anomaly=True,
 ):
     print(f"[PC] starting WM server at {host}:{port}")
-    inference = RealRobotRWMInference(model_path, device="cpu", remove_dof_vel=remove_dof_vel)
+    torch_device = _select_torch_device()
+    inference = RealRobotRWMInference(model_path, device=torch_device, remove_dof_vel=remove_dof_vel)
     policy = inference.get_inference_policy()
     candidate_selector = (
         WorldModelCandidateSelector(
             world_model=inference.world_model,
             action_dim=18,
-            horizon=4,
+            horizon=PC_CANDIDATE_HORIZON,
             max_lift_candidates=6,
-            device="cpu",
+            device=torch_device,
         )
         if (use_stability_filter and inference.world_model is not None)
         else None
@@ -63,7 +95,7 @@ def run_server(
             ema_alpha=CONTACT_ANOMALY_EMA_ALPHA,
             trigger_count=CONTACT_ANOMALY_TRIGGER_COUNT,
             action_dim=18,
-            device="cpu",
+            device=torch_device,
         )
         if (log_contact_anomaly and inference.world_model is not None)
         else None
@@ -157,12 +189,17 @@ def run_server(
                 prev_action = msg.get("prev_action")
                 prev_action = None if prev_action is None else np.asarray(prev_action, dtype=np.float32)
 
-                prop_t = torch.from_numpy(obs).unsqueeze(0)
-                history_t = torch.from_numpy(history).unsqueeze(0)
+                prop_t = torch.from_numpy(obs).to(device=torch_device, dtype=torch.float32).unsqueeze(0)
+                history_t = torch.from_numpy(history).to(device=torch_device, dtype=torch.float32).unsqueeze(0)
+                prev_action_t = (
+                    None
+                    if prev_action is None
+                    else torch.from_numpy(prev_action).to(device=torch_device, dtype=torch.float32).unsqueeze(0)
+                )
                 obs_dict = {"prop": prop_t, "is_first": inference.wm_is_first}
 
                 with torch.no_grad():
-                    wm_feature = inference.update_world_model(obs_dict, prev_action)
+                    wm_feature = inference.update_world_model(obs_dict, prev_action_t)
                     actions = policy(obs_dict["prop"], history_t, wm_feature)
                     detected_bad_leg = None
                     if contact_detector is not None:
@@ -214,11 +251,6 @@ def run_server(
 
                     if candidate_selector is not None and inference.wm_latent is not None:
                         try:
-                            prev_action_t = (
-                                None
-                                if prev_action is None
-                                else torch.from_numpy(prev_action).unsqueeze(0)
-                            )
                             actions = candidate_selector.select(
                                 prev_latent=inference.wm_latent,
                                 is_first=inference.wm_is_first,
@@ -303,7 +335,7 @@ def run_server(
                     "lift_ankle_final_target": filter_debug.get("lift_ankle_final_target", ""),
                     "lift_ankle_raw_target": filter_debug.get("lift_ankle_raw_target", ""),
                     "lift_ankle_blend": filter_debug.get("lift_ankle_blend", ""),
-                    "horizon": 4,
+                    "horizon": PC_CANDIDATE_HORIZON,
                     "server_ms": server_ms,
                     "action_min": float(action_raw.min()),
                     "action_max": float(action_raw.max()),

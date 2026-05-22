@@ -24,8 +24,8 @@ HIP_FORWARD_DIR = np.array(HIP_FORWARD_DIR_LIST, dtype=np.float32)
 
 # Deployment-side execution scale (rad per normalized action unit).
 # Keep defaults aligned with test_rwm_real_robot.py legacy runtime behavior.
-DEFAULT_HIP_KNEE_SCALE_RAD = 0.60
-DEFAULT_ANKLE_BASE_SCALE_RAD = 0.60
+DEFAULT_HIP_KNEE_SCALE_RAD = 0.50
+DEFAULT_ANKLE_BASE_SCALE_RAD = 0.50
 
 # Safety limits (rad per control step). Recommended ranges in comments.
 SAFETY_HIP_KNEE_MAX_DELTA_RAD = math.radians(2.5)  # 2~3 deg/step
@@ -59,6 +59,7 @@ LIFT_ANKLE_TARGET_BLEND = 0.90
 LIFT_RECOVERY_HOLD_STEPS = 10
 LIFT_RECOVERY_TRIGGER_RISK_LEVEL = 2
 LIFT_RECOVERY_TRIGGER_CONTACT_STEPS = 3
+WM_SELECTOR_IMAGINE_ONLY_WHEN_RISK = True
 
 # Simple right-front leg action offset.
 # Action order: [l1, l2, l3, r1, r2, r3], three joints per leg.
@@ -531,6 +532,33 @@ class WorldModelCandidateSelector:
             latch_active = latched_leg >= 0 and self.recovery_hold > 0
             effective_bad_leg = int(latched_leg if latch_active else bad_leg)
             effective_risk_level = int(max(risk_level, LIFT_RECOVERY_TRIGGER_RISK_LEVEL if latch_active else 0))
+            if WM_SELECTOR_IMAGINE_ONLY_WHEN_RISK and effective_risk_level <= 0:
+                lift_pose = self._lift_pose_debug(3)
+                self.last_debug = {
+                    "selected": "nominal",
+                    "selected_group": "nominal",
+                    "score": 0.0,
+                    "fallback": 0,
+                    "num_candidates": 1,
+                    "used": False,
+                    "risk_level": int(risk_level),
+                    "effective_risk_level": int(effective_risk_level),
+                    "bad_leg": int(bad_leg),
+                    "effective_bad_leg": int(effective_bad_leg),
+                    "forced_lift": False,
+                    "forced_lift_name": "",
+                    "forced_lift_reason": "",
+                    "recovery_latch_active": bool(latch_active),
+                    "recovery_latch_leg": int(latched_leg),
+                    "recovery_latch_hold": int(self.recovery_hold),
+                    "recovery_latch_triggered": bool(self.recovery_last_triggered),
+                    "recovery_latch_accepted": bool(self.recovery_last_accepted),
+                    "recovery_hold_steps": int(self.recovery_hold_steps),
+                    **lift_pose,
+                    "select_count": int(self._select_count),
+                    "skip_reason": "no_risk",
+                }
+                return nominal
 
             candidates = self._build_candidates(
                 nominal,

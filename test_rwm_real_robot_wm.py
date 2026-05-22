@@ -129,6 +129,14 @@ OPTIM_ENV_OMP_THREADS = None  # 设为与 OPTIM_TORCH_NUM_THREADS 相同整数�
 # torch.compile：WM 编码器 + RSSM obs_step + 策略子模块（需 PyTorch 2.0+）
 WM_OPT_TORCH_COMPILE = True
 POLICY_OPT_TORCH_COMPILE = True
+
+
+def _has_working_triton():
+    try:
+        import triton  # noqa: F401
+        return True
+    except Exception:
+        return False
 WM_COMPILE_MODE = "default"  # CPU 可试 "reduce-overhead"；失败会自动回退
 
 # Auto-disable torch.compile when no native compiler is available.
@@ -148,6 +156,10 @@ else:
         WM_OPT_TORCH_COMPILE = False
         POLICY_OPT_TORCH_COMPILE = False
         print("Warning: no native compiler detected, torch.compile disabled.")
+    elif torch.cuda.is_available() and not _has_working_triton():
+        WM_OPT_TORCH_COMPILE = False
+        POLICY_OPT_TORCH_COMPILE = False
+        print("Warning: CUDA is available but Triton is not working; torch.compile disabled.")
 
 # 仅编译 RSSM.obs_step（若 dynamo 对 dict 状态报错，可设 False 只保留 encoder 编译）
 WM_OPT_COMPILE_OBS_STEP = True

@@ -3,6 +3,7 @@ import csv
 import json
 import os
 import socket
+import threading
 import time
 from collections import deque
 from multiprocessing import Process, Queue
@@ -40,6 +41,107 @@ USE_ASYMMETRIC_ANKLE_MAPPING = True
 ASYM_ANKLE_LIFT_RANGE_RAD = 1.0
 ASYM_ANKLE_SINK_RANGE_RAD = 0.10
 LOG_FLUSH_EVERY_N_STEPS = 20
+ASYNC_CONTROL_ENABLED = True
+ASYNC_MAX_ACTION_AGE_MS = 250.0
+ASYNC_IDLE_SLEEP_S = 0.001
+
+
+class AsyncActionClient:
+    def __init__(self, server_addr, timeout_s=0.05):
+        self.server_addr = server_addr
+        self.timeout_s = float(timeout_s)
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.request_seq = 0
+        self.latest_request = None
+        self.latest_response = None
+        self.latest_response_time = 0.0
+        self.latest_request_ms = 0.0
+        self.latest_error = "no_response"
+        self.worker_ok_count = 0
+        self.worker_fallback_count = 0
+        self.thread = threading.Thread(target=self._run, name="AsyncActionClient", daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def close(self):
+        self.stop_event.set()
+        self.thread.join(timeout=max(0.5, self.timeout_s + 0.2))
+
+    def submit(self, step, obs, history, prev_action):
+        req = {
+            "step": int(step),
+            "obs": np.asarray(obs, dtype=np.float32).copy(),
+            "history": np.asarray(history, dtype=np.float32).copy(),
+            "prev_action": None if prev_action is None else np.asarray(prev_action, dtype=np.float32).copy(),
+        }
+        with self.lock:
+            self.request_seq += 1
+            self.latest_request = req
+
+    def snapshot(self):
+        now = time.perf_counter()
+        with self.lock:
+            resp = None if self.latest_response is None else dict(self.latest_response)
+            age_ms = float("inf") if resp is None else float((now - self.latest_response_time) * 1000.0)
+            return {
+                "resp": resp,
+                "action_age_ms": age_ms,
+                "request_ms": float(self.latest_request_ms),
+                "net_error": str(self.latest_error),
+                "worker_ok_count": int(self.worker_ok_count),
+                "worker_fallback_count": int(self.worker_fallback_count),
+                "request_seq": int(self.request_seq),
+            }
+
+    def _run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        last_sent_seq = 0
+        try:
+            while not self.stop_event.is_set():
+                with self.lock:
+                    seq = int(self.request_seq)
+                    req = self.latest_request
+                if req is None or seq == last_sent_seq:
+                    self.stop_event.wait(ASYNC_IDLE_SLEEP_S)
+                    continue
+                last_sent_seq = seq
+                request_t0 = time.perf_counter()
+                try:
+                    resp = _request_action(
+                        sock=sock,
+                        server_addr=self.server_addr,
+                        step=req["step"],
+                        obs=req["obs"],
+                        history=req["history"],
+                        prev_action=req["prev_action"],
+                        timeout_s=self.timeout_s,
+                    )
+                    request_ms = float((time.perf_counter() - request_t0) * 1000.0)
+                    resp_step = int(resp.get("step", -1))
+                    ok = bool(resp.get("ok")) and resp_step == int(req["step"])
+                    with self.lock:
+                        self.latest_request_ms = request_ms
+                        if ok:
+                            self.latest_response = resp
+                            self.latest_response_time = time.perf_counter()
+                            self.latest_error = ""
+                            self.worker_ok_count += 1
+                        else:
+                            self.latest_error = f"bad_response_ok={resp.get('ok')}_step={resp_step}"
+                            self.worker_fallback_count += 1
+                except Exception as e:
+                    request_ms = float((time.perf_counter() - request_t0) * 1000.0)
+                    with self.lock:
+                        self.latest_request_ms = request_ms
+                        self.latest_error = type(e).__name__
+                        self.worker_fallback_count += 1
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 def _request_action(sock, server_addr, step, obs, history, prev_action, timeout_s=0.05):
@@ -118,12 +220,25 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
         f"ankle[11]+={RIGHT_FRONT_ANKLE_ACTION_OFFSET:.2f}"
     )
     print(f"[RPI] Rate limiter: {'ENABLED' if enable_rate_limiter else 'DISABLED'}")
+    print(
+        "[RPI] Remote control mode: "
+        f"{'ASYNC' if ASYNC_CONTROL_ENABLED else 'SYNC'} "
+        f"target_dt={TARGET_DT * 1000.0:.1f}ms "
+        f"max_action_age={ASYNC_MAX_ACTION_AGE_MS:.1f}ms"
+    )
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server_addr = (server_ip, server_port)
+    sock = None
+    async_client = None
+    if ASYNC_CONTROL_ENABLED:
+        async_client = AsyncActionClient(server_addr, timeout_s=timeout_s)
+        async_client.start()
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     prev_action_for_obs = None
     last_safe_action = np.zeros(18, dtype=np.float32)
+    last_used_resp_step = -1
     net_ok_count = 0
     net_fallback_count = 0
     last_event_key = None
@@ -153,6 +268,8 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
                     "exec_action_min", "exec_action_max", "exec_action_mean",
                     "net_ok", "net_fallback", "net_error", "resp_step",
                     "server_ms", "request_ms", "control_dt_ms", "loop_dt_ms", "timeout_ms",
+                    "async_mode", "async_new_response", "async_action_age_ms",
+                    "async_request_seq", "async_worker_ok_count", "async_worker_fallback_count",
                     "risk_level", "wm_error", "contact_error", "contact_anomaly", "contact_steps",
                     "detected_bad_leg", "bad_leg", "candidate_selected", "candidate_group", "candidate_score",
                     "effective_bad_leg", "effective_risk_level",
@@ -177,48 +294,89 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
                 net_fallback_step = False
                 net_error = ""
                 request_t0 = None
+                async_new_response = False
+                async_action_age_ms = float("inf")
+                async_request_seq = 0
+                async_worker_ok_count = 0
+                async_worker_fallback_count = 0
                 real_obs, obs_wo_cmd, position_read, imu_data = create_observation_from_real_robot(
                     servos, q_imu, step, history_length, cpg_reward, prev_action_for_obs
                 )
                 history_flat = np.concatenate(list(trajectory_history)).astype(np.float32)
 
-                try:
-                    request_t0 = time.perf_counter()
-                    resp = _request_action(
-                        sock=sock,
-                        server_addr=server_addr,
+                if ASYNC_CONTROL_ENABLED:
+                    async_client.submit(
                         step=step,
                         obs=real_obs,
                         history=history_flat,
                         prev_action=prev_action_for_obs,
-                        timeout_s=timeout_s,
                     )
-                    request_ms = float((time.perf_counter() - request_t0) * 1000.0)
+                    async_dbg = async_client.snapshot()
+                    resp = async_dbg["resp"] or {}
+                    async_action_age_ms = float(async_dbg["action_age_ms"])
+                    async_request_seq = int(async_dbg["request_seq"])
+                    async_worker_ok_count = int(async_dbg["worker_ok_count"])
+                    async_worker_fallback_count = int(async_dbg["worker_fallback_count"])
+                    request_ms = float(async_dbg["request_ms"])
                     resp_step = int(resp.get("step", -1))
                     server_ms = float(resp.get("server_ms", 0.0))
-                    if resp.get("ok") and resp_step == step:
+                    fresh_resp = bool(resp.get("ok")) and async_action_age_ms <= ASYNC_MAX_ACTION_AGE_MS
+                    async_new_response = bool(fresh_resp and resp_step != last_used_resp_step)
+                    if fresh_resp:
                         action_raw = np.asarray(resp["action_raw"], dtype=np.float32)
                         last_safe_action = action_raw.copy()
+                        last_used_resp_step = resp_step
                         net_ok_count += 1
                         net_ok_step = True
                     else:
                         action_raw = last_safe_action.copy()
                         net_fallback_count += 1
                         net_fallback_step = True
-                        net_error = f"bad_response_ok={resp.get('ok')}_step={resp_step}"
+                        if resp:
+                            net_error = "stale_async_action"
+                        else:
+                            net_error = str(async_dbg["net_error"] or "no_async_response")
                         if (net_fallback_count <= 5) or (step % max(1, int(log_every)) == 0):
-                            print(
-                                f"[RPI] fallback step={step}: resp_ok={resp.get('ok')} resp_step={resp.get('step')}"
-                            )
-                except Exception as e:
-                    # network timeout / decode error fallback
-                    request_ms = float((time.perf_counter() - request_t0) * 1000.0) if request_t0 is not None else 0.0
-                    action_raw = last_safe_action.copy()
-                    net_fallback_count += 1
-                    net_fallback_step = True
-                    net_error = type(e).__name__
-                    if (net_fallback_count <= 5) or (step % max(1, int(log_every)) == 0):
-                        print(f"[RPI] fallback step={step}: timeout/decode, using last_safe_action")
+                            age_text = "inf" if not np.isfinite(async_action_age_ms) else f"{async_action_age_ms:.1f}"
+                            print(f"[RPI] fallback step={step}: async action unavailable/stale age={age_text}ms")
+                else:
+                    try:
+                        request_t0 = time.perf_counter()
+                        resp = _request_action(
+                            sock=sock,
+                            server_addr=server_addr,
+                            step=step,
+                            obs=real_obs,
+                            history=history_flat,
+                            prev_action=prev_action_for_obs,
+                            timeout_s=timeout_s,
+                        )
+                        request_ms = float((time.perf_counter() - request_t0) * 1000.0)
+                        resp_step = int(resp.get("step", -1))
+                        server_ms = float(resp.get("server_ms", 0.0))
+                        if resp.get("ok") and resp_step == step:
+                            action_raw = np.asarray(resp["action_raw"], dtype=np.float32)
+                            last_safe_action = action_raw.copy()
+                            net_ok_count += 1
+                            net_ok_step = True
+                        else:
+                            action_raw = last_safe_action.copy()
+                            net_fallback_count += 1
+                            net_fallback_step = True
+                            net_error = f"bad_response_ok={resp.get('ok')}_step={resp_step}"
+                            if (net_fallback_count <= 5) or (step % max(1, int(log_every)) == 0):
+                                print(
+                                    f"[RPI] fallback step={step}: resp_ok={resp.get('ok')} resp_step={resp.get('step')}"
+                                )
+                    except Exception as e:
+                        # network timeout / decode error fallback
+                        request_ms = float((time.perf_counter() - request_t0) * 1000.0) if request_t0 is not None else 0.0
+                        action_raw = last_safe_action.copy()
+                        net_fallback_count += 1
+                        net_fallback_step = True
+                        net_error = type(e).__name__
+                        if (net_fallback_count <= 5) or (step % max(1, int(log_every)) == 0):
+                            print(f"[RPI] fallback step={step}: timeout/decode, using last_safe_action")
 
                 # Log observation in the same format used by local mode.
                 obs_str = "\t".join([f"{x:.6f}" for x in real_obs])
@@ -305,6 +463,12 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
                         "control_dt_ms": float(control_dt_ms),
                         "loop_dt_ms": float(loop_dt_ms),
                         "timeout_ms": float(timeout_s * 1000.0),
+                        "async_mode": int(ASYNC_CONTROL_ENABLED),
+                        "async_new_response": int(async_new_response),
+                        "async_action_age_ms": float(async_action_age_ms if np.isfinite(async_action_age_ms) else -1.0),
+                        "async_request_seq": int(async_request_seq),
+                        "async_worker_ok_count": int(async_worker_ok_count),
+                        "async_worker_fallback_count": int(async_worker_fallback_count),
                         "risk_level": int(risk_level),
                         "wm_error": float(risk_ema),
                         "contact_error": float(contact_error),
@@ -357,6 +521,9 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
                         f"net_ok={net_ok_count} fallback={net_fallback_count} "
                         f"resp_step={resp_step} server_ms={server_ms:.1f} request_ms={request_ms:.1f} "
                         f"loop_dt={loop_dt_ms:.1f} "
+                        f"async_age={async_action_age_ms if np.isfinite(async_action_age_ms) else -1.0:.1f} "
+                        f"new_resp={int(async_new_response)} "
+                        f"worker_ok={async_worker_ok_count} worker_fb={async_worker_fallback_count} "
                         f"raw[min={action_raw.min():.4f}, max={action_raw.max():.4f}, mean={action_raw.mean():.4f}] "
                         f"risk={risk_level} contact_anomaly={int(contact_anomaly)} contact_steps={contact_steps} "
                         f"det_bad_leg={detected_bad_leg} bad_leg={bad_leg} eff_bad_leg={effective_bad_leg} "
@@ -372,6 +539,16 @@ def run_client(server_ip, server_port, timeout_s=0.05, log_every=50, enable_rate
             print("\n[RPI] Reached MAX_STEPS. Robot keeps holding last pose (torque still enabled).")
             input("[RPI] Press Enter to finish and disable torque...")
     finally:
+        try:
+            if async_client is not None:
+                async_client.close()
+        except Exception:
+            pass
+        try:
+            if sock is not None:
+                sock.close()
+        except Exception:
+            pass
         try:
             servos.disable_torque(position_all)
         except Exception:
