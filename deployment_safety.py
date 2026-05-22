@@ -24,8 +24,8 @@ HIP_FORWARD_DIR = np.array(HIP_FORWARD_DIR_LIST, dtype=np.float32)
 
 # Deployment-side execution scale (rad per normalized action unit).
 # Keep defaults aligned with test_rwm_real_robot.py legacy runtime behavior.
-DEFAULT_HIP_KNEE_SCALE_RAD = 0.50
-DEFAULT_ANKLE_BASE_SCALE_RAD = 0.50
+DEFAULT_HIP_KNEE_SCALE_RAD = 0.60
+DEFAULT_ANKLE_BASE_SCALE_RAD = 0.60
 
 # Safety limits (rad per control step). Recommended ranges in comments.
 SAFETY_HIP_KNEE_MAX_DELTA_RAD = math.radians(2.5)  # 2~3 deg/step
@@ -56,7 +56,7 @@ LIFT_KNEE_TARGET_ACTION = 1.0
 LIFT_KNEE_TARGET_BLEND = 1.0
 LIFT_ANKLE_TARGET_ACTION = 0.0
 LIFT_ANKLE_TARGET_BLEND = 0.90
-LIFT_RECOVERY_HOLD_STEPS = 16
+LIFT_RECOVERY_HOLD_STEPS = 10
 LIFT_RECOVERY_TRIGGER_RISK_LEVEL = 2
 LIFT_RECOVERY_TRIGGER_CONTACT_STEPS = 3
 
